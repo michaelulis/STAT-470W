@@ -713,3 +713,214 @@ ggplot(
   ) +
   theme_minimal()
 ```
+
+
+### Zero Wikipedia Pageviews
+
+A substantial number of landmarks have zero recorded Wikipedia pageviews.
+Because zero values cannot be displayed on a standard log10 scale, it is useful
+to examine whether zero pageviews occur equally across landmark categories.
+
+```{r}
+# Calculate the proportion of landmarks with zero Wikipedia pageviews
+# within each landmark category
+zero_pageviews_by_category <- castles_clean |>
+  group_by(category) |>
+  summarise(
+    n = n(),
+    zero_pageviews = sum(pageviews == 0),
+    proportion_zero = mean(pageviews == 0),
+    .groups = "drop"
+  ) |>
+  arrange(desc(proportion_zero))
+
+zero_pageviews_by_category
+```
+
+```{r}
+# Visualize the percentage of landmarks with zero Wikipedia pageviews
+# within each category
+zero_pageviews_by_category |>
+  ggplot(aes(
+    x = reorder(category, proportion_zero),
+    y = proportion_zero
+  )) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Landmarks with Zero Wikipedia Pageviews by Category",
+    x = "Landmark Category",
+    y = "Percentage with Zero Pageviews"
+  ) +
+  theme_minimal()
+```
+
+### Missing Founding Years
+
+Founding year is missing for a substantial proportion of the landmarks in the
+dataset. Before examining relationships involving founding year, it is useful
+to determine whether missingness differs across landmark categories.
+
+```{r}
+# Calculate the amount of missing founding-year information
+# within each landmark category
+missing_year_by_category <- castles_clean |>
+  group_by(category) |>
+  summarise(
+    n = n(),
+    missing_year = sum(is.na(year)),
+    proportion_missing = mean(is.na(year)),
+    .groups = "drop"
+  ) |>
+  arrange(desc(proportion_missing))
+
+missing_year_by_category
+```
+
+```{r}
+# Visualize the proportion of missing founding years by category
+missing_year_by_category |>
+  ggplot(aes(
+    x = reorder(category, proportion_missing),
+    y = proportion_missing
+  )) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Missing Founding Years by Landmark Category",
+    x = "Landmark Category",
+    y = "Percentage Missing Founding Year"
+  ) +
+  theme_minimal()
+```
+
+
+## Fame Rank and Wikipedia Popularity
+
+
+### Fame Rank and Wikipedia Popularity
+
+The dataset also contains a `fame_rank` variable, where smaller values represent
+more highly ranked landmarks. We can compare this ranking with Wikipedia
+pageviews to see how closely the two measures of prominence agree.
+
+```{r}
+# Compare fame rank with Wikipedia pageviews
+# log10(pageviews + 1) retains landmarks with zero pageviews
+ggplot(
+  castles_clean,
+  aes(
+    x = fame_rank,
+    y = log10(pageviews + 1)
+  )
+) +
+  geom_point(alpha = 0.3) +
+  labs(
+    title = "Fame Rank vs. Wikipedia Pageviews",
+    x = "Fame Rank",
+    y = "log10(Annual Wikipedia Pageviews + 1)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Use Spearman correlation because fame_rank is itself a ranking
+# and the popularity variables are strongly skewed
+cor(
+  castles_clean$fame_rank,
+  castles_clean$pageviews,
+  method = "spearman"
+)
+
+cor(
+  castles_clean$fame_rank,
+  castles_clean$sitelinks,
+  method = "spearman"
+)
+```
+
+
+
+## Distribution of Wikipedia Sitelinks
+
+### Distribution of Wikipedia Sitelinks
+
+The number of Wikipedia sitelinks measures how many language editions contain
+an article about a landmark. Before comparing sitelinks with pageviews, we can
+examine the distribution of this measure on its own.
+
+```{r}
+# Examine the distribution of Wikipedia sitelinks
+ggplot(castles_clean, aes(x = sitelinks)) +
+  geom_histogram(binwidth = 5) +
+  labs(
+    title = "Distribution of Wikipedia Sitelinks",
+    x = "Number of Wikipedia Sitelinks",
+    y = "Number of Landmarks"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Compare the distribution of sitelinks across landmark categories
+ggplot(castles_clean, aes(x = category, y = sitelinks)) +
+  geom_boxplot() +
+  labs(
+    title = "Wikipedia Sitelinks by Landmark Category",
+    x = "Landmark Category",
+    y = "Number of Wikipedia Sitelinks"
+  ) +
+  theme_minimal()
+```
+
+
+
+## Century and Landmark Popularity
+
+### Landmark Popularity by Century
+
+In addition to examining how many landmarks were founded in each historical
+period, we can compare whether landmarks from some centuries tend to receive
+more Wikipedia attention than others.
+
+```{r}
+# Compare median Wikipedia pageviews across centuries
+# Only centuries represented by at least 30 landmarks are included
+century_popularity <- castles_clean |>
+  filter(!is.na(century)) |>
+  group_by(century) |>
+  summarise(
+    n = n(),
+    median_pageviews = median(pageviews),
+    mean_pageviews = mean(pageviews),
+    .groups = "drop"
+  ) |>
+  filter(n >= 30)
+
+century_popularity |>
+  arrange(desc(median_pageviews))
+```
+
+```{r}
+# Display median pageviews for the most well-represented centuries
+century_popularity |>
+  ggplot(aes(
+    x = reorder(century, median_pageviews),
+    y = median_pageviews
+  )) +
+  geom_col() +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Median Wikipedia Pageviews by Century",
+    subtitle = "Only centuries with at least 30 landmarks are included",
+    x = "Century",
+    y = "Median Annual Wikipedia Pageviews (log scale)"
+  ) +
+  theme_minimal()
+```
+
+
+
