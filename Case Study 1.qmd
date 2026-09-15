@@ -4,23 +4,712 @@ format: html
 editor: visual
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+## Setup and Data Import
 
 ```{r}
-1 + 1
+library(tidyverse)
+# pull in the data
+world_castles <- read_csv(
+  "https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2026/2026-09-01/world_castles.csv"
+)
 ```
-
-You can add options to executable code like this
 
 ```{r}
-#| echo: false
-2 * 2
+glimpse(world_castles)
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r}
+dim(world_castles)
+
+summary(world_castles)
+
+colSums(is.na(world_castles))
+```
+
+```{r}
+world_castles |>
+  count(category)
+
+world_castles |>
+  count(country, sort = TRUE)
+```
+
+## Data Cleaning
+
+```{r}
+# Create a cleaned version of the original castles data
+castles_clean <- world_castles |>
+  
+  # Remove the 5 observations without an ISO country code
+  filter(!is.na(iso)) |>
+  
+  # Remove the one observation with missing pageview information
+  filter(!is.na(pageviews))
+```
+
+```{r}
+# Add an approximate age variable for landmarks with a known founding year
+# Since the data are from 2026, age is calculated as 2026 minus founding year
+castles_clean <- castles_clean |>
+  mutate(age = 2026 - year)
+```
+
+## Initial Data Exploration
+
+### Landmark Categories
+
+```{r}
+# Count the number of landmarks in each category and display the results
+# as a bar chart
+castles_clean |>
+  count(category) |>
+  ggplot(aes(x = reorder(category, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Number of Landmarks by Category",
+    x = "Landmark Category",
+    y = "Number of Landmarks"
+  ) +
+  theme_minimal()
+```
+
+### Distribution of Wikipedia Pageviews
+
+```{r}
+# Examine the distribution of annual Wikipedia pageviews
+# A histogram shows whether most landmarks have similar popularity
+# or whether a small number receive substantially more views
+ggplot(castles_clean, aes(x = pageviews)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of Wikipedia Pageviews",
+    x = "Annual Wikipedia Pageviews",
+    y = "Number of Landmarks"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Pageviews are highly right-skewed, so a log10 scale makes the
+# differences among less-famous landmarks easier to see
+ggplot(castles_clean, aes(x = pageviews)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of Wikipedia Pageviews",
+    subtitle = "Pageviews shown on a log10 scale",
+    x = "Annual Wikipedia Pageviews (log scale)",
+    y = "Number of Landmarks"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Identify the 15 landmarks with the most Wikipedia pageviews
+castles_clean |>
+  arrange(desc(pageviews)) |>
+  select(name, country, category, year, pageviews, sitelinks, fame_rank) |>
+  slice_head(n = 15)
+```
+
+### Distribution of Founding Years
+
+```{r}
+# Examine when landmarks in the dataset were founded
+# Rows with unknown founding years are excluded only for this analysis
+castles_clean |>
+  filter(!is.na(year)) |>
+  ggplot(aes(x = year)) +
+  geom_histogram(binwidth = 100) +
+  labs(
+    title = "Distribution of Landmark Founding Years",
+    x = "Founding Year",
+    y = "Number of Landmarks"
+  ) +
+  theme_minimal()
+```
+
+## Landmark Popularity
+
+### Popularity by Landmark Category
+
+```{r}
+# Compare Wikipedia popularity across the four landmark categories
+# A log10 scale is used because pageviews are highly right-skewed
+ggplot(castles_clean, aes(x = category, y = pageviews)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(
+    title = "Wikipedia Pageviews by Landmark Category",
+    x = "Landmark Category",
+    y = "Annual Wikipedia Pageviews (log scale)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Calculate summary statistics for pageviews within each landmark category
+
+castles_clean |>
+  group_by(category) |>
+  summarise(
+    n = n(),
+    median_pageviews = median(pageviews),
+    mean_pageviews = mean(pageviews),
+    max_pageviews = max(pageviews)
+  ) |>
+  arrange(desc(median_pageviews))
+```
+
+### Founding Year and Popularity
+
+```{r}
+# Explore the relationship between founding year and Wikipedia popularity
+# Pageviews are displayed on a log10 scale because of their strong skew
+castles_clean |>
+  filter(!is.na(year)) |>
+  ggplot(aes(x = year, y = pageviews)) +
+  geom_point(alpha = 0.3) +
+  scale_y_log10() +
+  labs(
+    title = "Landmark Founding Year vs. Wikipedia Pageviews",
+    x = "Founding Year",
+    y = "Annual Wikipedia Pageviews (log scale)"
+  ) +
+  theme_minimal()
+```
+
+### Wikipedia Sitelinks and Pageviews
+
+```{r}
+# Compare two measures of landmark popularity:
+# annual Wikipedia pageviews and the number of Wikipedia language editions
+# containing an article about the landmark
+ggplot(castles_clean, aes(x = sitelinks, y = pageviews)) +
+  geom_point(alpha = 0.3) +
+  scale_y_log10() +
+  labs(
+    title = "Wikipedia Language Coverage vs. Pageviews",
+    x = "Number of Wikipedia Sitelinks",
+    y = "Annual Wikipedia Pageviews (log scale)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Calculate the correlation between sitelinks and pageviews
+# This summarizes the strength of the linear relationship between
+# the two measures of popularity
+cor(castles_clean$sitelinks, castles_clean$pageviews)
+```
+
+```{r}
+# Recalculate the correlation using log-transformed pageviews
+# This reduces the influence of a small number of extremely
+# high-pageview landmarks
+cor(castles_clean$sitelinks, log10(castles_clean$pageviews + 1))
+```
+
+## Geographic Exploration
+
+### Popularity by Country
+
+```{r}
+# Compare the typical popularity of landmarks across countries
+# Only countries with at least 30 landmarks are included so that countries
+# represented by only a few unusually famous landmarks do not dominate the results
+country_popularity <- castles_clean |>
+  group_by(country) |>
+  summarise(
+    n = n(),
+    median_pageviews = median(pageviews),
+    mean_pageviews = mean(pageviews)
+  ) |>
+  filter(n >= 30) |>
+  arrange(desc(median_pageviews))
+
+# Display the 15 countries with the highest median pageviews
+country_popularity |>
+  slice_head(n = 15)
+```
+
+```{r}
+# Plot the 15 countries with the highest median landmark pageviews
+country_popularity |>
+  slice_head(n = 15) |>
+  ggplot(aes(
+    x = reorder(country, median_pageviews),
+    y = median_pageviews
+  )) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Countries with the Most Popular Landmarks",
+    subtitle = "Countries with at least 30 landmarks in the dataset",
+    x = "Country",
+    y = "Median Annual Wikipedia Pageviews"
+  ) +
+  theme_minimal()
+```
+
+### Landmark Types Across Countries
+
+```{r}
+# Identify the 10 countries containing the most landmarks in the dataset
+top_countries <- castles_clean |>
+  count(country, sort = TRUE) |>
+  slice_head(n = 10) |>
+  pull(country)
+
+# For each of the top 10 countries, calculate the proportion of landmarks
+# belonging to each category
+country_category <- castles_clean |>
+  filter(country %in% top_countries) |>
+  count(country, category) |>
+  group_by(country) |>
+  mutate(proportion = n / sum(n)) |>
+  ungroup()
+
+# Display the category composition of landmarks in the top 10 countries
+ggplot(
+  country_category,
+  aes(x = reorder(country, proportion), y = proportion, fill = category)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Landmark Types in the Countries with the Most Landmarks",
+    x = "Country",
+    y = "Proportion of Landmarks",
+    fill = "Landmark Category"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Calculate median pageviews for each landmark category within the
+# 10 countries containing the most landmarks in the dataset
+country_category_popularity <- castles_clean |>
+  filter(country %in% top_countries) |>
+  group_by(country, category) |>
+  summarise(
+    n = n(),
+    median_pageviews = median(pageviews),
+    .groups = "drop"
+  )
+
+# Display the results 
+country_category_popularity
+```
+
+```{r}
+# Compare median Wikipedia pageviews across landmark categories
+# within each of the 10 countries containing the most landmarks
+ggplot(
+  country_category_popularity,
+  aes(
+    x = category,
+    y = median_pageviews,
+    fill = category
+  )
+) +
+  geom_col() +
+  facet_wrap(~ country) +
+  scale_y_log10() +
+  labs(
+    title = "Landmark Popularity by Category and Country",
+    subtitle = "Ten countries with the most landmarks in the dataset",
+    x = "Landmark Category",
+    y = "Median Annual Wikipedia Pageviews (log scale)",
+    fill = "Landmark Category"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## Landmark History
+
+### Founding Years by Landmark Category
+
+```{r}
+# Compare the distribution of founding years across landmark categories
+castles_clean |>
+  filter(!is.na(year)) |>
+  ggplot(aes(x = category, y = year)) +
+  geom_boxplot() +
+  labs(
+    title = "Founding Years by Landmark Category",
+    x = "Landmark Category",
+    y = "Founding Year"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Summarize founding years for each landmark category
+# Median is useful because a small number of extremely ancient landmarks
+# can strongly affect the mean founding year
+castles_clean |>
+  filter(!is.na(year)) |>
+  group_by(category) |>
+  summarise(
+    n_with_year = n(),
+    median_year = median(year),
+    mean_year = mean(year),
+    earliest_year = min(year),
+    latest_year = max(year)
+  ) |>
+  arrange(median_year)
+```
+
+## Additional Popularity Exploration
+
+### Comparing Measures of Fame
+
+```{r}
+# Identify the landmarks appearing in the largest number of
+# Wikipedia language editions
+castles_clean |>
+  arrange(desc(sitelinks)) |>
+  select(
+    name, country, category, year,
+    sitelinks, pageviews, fame_rank
+  ) |>
+  slice_head(n = 15)
+```
+
+```{r}
+# Identify the landmarks receiving the most annual Wikipedia pageviews
+# This can be compared with the sitelinks ranking to see whether
+# international coverage and page traffic identify the same landmarks
+castles_clean |>
+  arrange(desc(pageviews)) |>
+  select(
+    name, country, category, year,
+    sitelinks, pageviews, fame_rank
+  ) |>
+  slice_head(n = 15)
+```
+
+```{r}
+# Calculate each landmark's percentile rank for pageviews and sitelinks
+# Values near 1 indicate that a landmark ranks very highly compared
+# with the rest of the dataset
+castles_fame <- castles_clean |>
+  mutate(
+    pageview_percentile = percent_rank(pageviews),
+    sitelink_percentile = percent_rank(sitelinks)
+  )
+```
+
+```{r}
+# Find landmarks in the top 10% for Wikipedia language coverage
+# but below the median for annual pageviews
+# These may be internationally documented landmarks that receive
+# relatively modest current Wikipedia traffic
+castles_fame |>
+  filter(
+    sitelink_percentile >= 0.90,
+    pageview_percentile < 0.50
+  ) |>
+  arrange(desc(sitelinks)) |>
+  select(
+    name, country, category,
+    sitelinks, pageviews,
+    sitelink_percentile, pageview_percentile
+  ) |>
+  slice_head(n = 15)
+```
+
+```{r}
+# Find landmarks in the top 10% for annual pageviews
+castles_fame |>
+  filter(
+    pageview_percentile >= 0.90,
+    sitelink_percentile < 0.50
+  ) |>
+  arrange(desc(pageviews)) |>
+  select(
+    name, country, category,
+    sitelinks, pageviews,
+    sitelink_percentile, pageview_percentile
+  ) |>
+  slice_head(n = 15)
+
+```
+
+## Multivariate Exploration
+
+### Founding Year and Popularity by Category
+
+```{r}
+# Explore the relationship between founding year and Wikipedia popularity
+# separately for castles, fortresses, palaces, and ruins
+
+castles_clean |>
+  filter(!is.na(year)) |>
+  ggplot(aes(x = year, y = pageviews)) +
+  geom_point(alpha = 0.3) +
+  scale_y_log10() +
+  facet_wrap(~ category) +
+  labs(
+    title = "Founding Year and Popularity by Landmark Category",
+    subtitle = "Only landmarks with known founding years are included",
+    x = "Founding Year",
+    y = "Annual Wikipedia Pageviews (log scale)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Calculate the correlation between founding year and log-transformed
+# pageviews separately for each landmark category
+#
+# The log transformation reduces the influence of a small number of
+# landmarks with extremely high pageview counts
+castles_clean |>
+  filter(!is.na(year)) |>
+  group_by(category) |>
+  summarise(
+    n = n(),
+    correlation = cor(year, log10(pageviews + 1))
+  )
+```
+
+### Century Distribution
+
+```{r}
+# Examine the existing century variable before using it
+# This lets us understand how historical periods are coded in the dataset
+castles_clean |>
+  count(century, sort = TRUE)
+```
+
+## Geographic Maps
+
+### Overall Geographic Distribution
+
+```{r}
+# Load world map boundaries included with ggplot2
+world_map <- map_data("world")
+
+# Plot the geographic locations of all landmarks in the dataset
+# Each point represents one castle, fortress, palace, or ruin
+ggplot() +
+  geom_polygon(
+    data = world_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray90",
+    color = "white"
+  ) +
+  geom_point(
+    data = castles_clean,
+    aes(x = lon, y = lat),
+    alpha = 0.4,
+    size = 0.8
+  ) +
+  coord_quickmap() +
+  labs(
+    title = "Geographic Distribution of Landmarks",
+    subtitle = "Each point represents one landmark in the dataset",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+### Geographic Distribution by Category
+
+```{r}
+# Map landmarks by category to explore whether castles, fortresses,
+# palaces, and ruins have different geographic distributions
+ggplot() +
+  geom_polygon(
+    data = world_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray90",
+    color = "white"
+  ) +
+  geom_point(
+    data = castles_clean,
+    aes(x = lon, y = lat, color = category),
+    alpha = 0.6,
+    size = 1
+  ) +
+  coord_quickmap() +
+  labs(
+    title = "Geographic Distribution by Landmark Category",
+    subtitle = "Castles, fortresses, palaces, and ruins around the world",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Landmark Category"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Map the geographic distribution of each landmark category separately
+# Faceting reduces overlap and makes it easier to compare the locations
+# of castles, fortresses, palaces, and ruins
+ggplot() +
+  geom_polygon(
+    data = world_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray90",
+    color = "white"
+  ) +
+  geom_point(
+    data = castles_clean,
+    aes(x = lon, y = lat),
+    alpha = 0.5,
+    size = 0.7
+  ) +
+  facet_wrap(~ category, ncol = 2) +
+  coord_quickmap() +
+  labs(
+    title = "Geographic Distribution by Landmark Category",
+    subtitle = "Each panel shows one type of landmark",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+### Geographic Distribution of Popular Landmarks
+
+```{r}
+# Divide landmarks into four popularity groups based on annual pageviews
+# Percentile groups make geographic differences easier to visualize
+# despite the extremely skewed pageview distribution
+castles_geo <- castles_clean |>
+  mutate(
+    popularity_group = case_when(
+      percent_rank(pageviews) >= 0.90 ~ "Top 10%",
+      percent_rank(pageviews) >= 0.50 ~ "50th–90th percentile",
+      TRUE ~ "Bottom 50%"
+    )
+  )
+```
+
+```{r}
+# Map only landmarks in the top 10% of annual Wikipedia pageviews
+# This allows us to explore where the dataset's most-viewed
+# landmarks are geographically concentrated
+ggplot() +
+  geom_polygon(
+    data = world_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray90",
+    color = "white"
+  ) +
+  geom_point(
+    data = castles_geo |>
+      filter(popularity_group == "Top 10%"),
+    aes(x = lon, y = lat),
+    alpha = 0.7,
+    size = 1
+  ) +
+  coord_quickmap() +
+  labs(
+    title = "Location of the Most Popular Landmarks",
+    subtitle = "Landmarks in the top 10% of annual Wikipedia pageviews",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+## Data Quality Exploration
+
+### Approximate Founding Years
+
+```{r}
+# Calculate the proportion of approximate founding dates
+# within each landmark category
+castles_clean |>
+  filter(!is.na(year)) |>
+  group_by(category) |>
+  summarise(
+    n = n(),
+    approximate_years = sum(year_approx == 1),
+    proportion_approximate = mean(year_approx == 1)
+  )
+```
+
+```{r}
+# Compare the founding-year distributions for landmarks with
+# exact versus approximate founding dates
+castles_clean |>
+  filter(!is.na(year)) |>
+  mutate(
+    year_type = if_else(
+      year_approx == 1,
+      "Approximate year",
+      "Exact year"
+    )
+  ) |>
+  ggplot(aes(x = year_type, y = year)) +
+  geom_boxplot() +
+  labs(
+    title = "Exact vs. Approximate Landmark Founding Years",
+    x = "Type of Founding Year",
+    y = "Founding Year"
+  ) +
+  theme_minimal()
+```
+
+## Multivariate Exploration: Country, Category, and Popularity
+
+```{r}
+# Identify the five countries with the largest number of landmarks
+# Limiting the analysis to five countries keeps the visualization readable
+top_5_countries <- castles_clean |>
+  count(country, sort = TRUE) |>
+  slice_head(n = 5) |>
+  pull(country)
+
+
+# Calculate median pageviews for each landmark category within each country
+# Category-country combinations with fewer than 20 landmarks are removed
+# so that medians are not based on very small groups
+country_category_comparison <- castles_clean |>
+  filter(country %in% top_5_countries) |>
+  group_by(country, category) |>
+  summarise(
+    n = n(),
+    median_pageviews = median(pageviews),
+    .groups = "drop"
+  ) |>
+  filter(n >= 20)
+
+
+# Display the values before graphing them
+country_category_comparison
+```
+
+```{r}
+# Compare the typical popularity of landmark categories across countries
+ggplot(
+  country_category_comparison,
+  aes(
+    x = category,
+    y = median_pageviews,
+    group = country,
+    color = country
+  )
+) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_y_log10() +
+  labs(
+    title = "Landmark Category and Popularity Across Countries",
+    subtitle = "Only category-country groups with at least 20 landmarks",
+    x = "Landmark Category",
+    y = "Median Annual Wikipedia Pageviews (log scale)",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
