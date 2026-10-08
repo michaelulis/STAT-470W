@@ -8,12 +8,637 @@ editor: visual
 
 ### Libraries
 
-
-
 ### Data Set
 
 ```{r}
 lego <- read.csv("case-study2-data.csv")
 ```
 
+## Exploratory Data Analysis: Theme, Pieces, Minifigures, and Unique Pieces (Gavin)
 
+### 1. Data Preparation
+
+#### 1.1 Variable Types and Missing Values
+
+```{r}
+View(lego)
+```
+
+```{r}
+## EDA — Theme, Pieces, Minifigures, and Unique Pieces
+
+### Data Preparation
+
+# Convert Amazon_Price from text (e.g., "$19.99") to a number
+lego$Amazon_Price <- as.numeric(gsub("[$,]", "", lego$Amazon_Price))
+
+# Check the structure of the variables we will analyze
+str(lego[, c("Amazon_Price", "Theme", "Pieces",
+             "Minifigures", "Unique_Pieces")])
+
+# Count missing values in our variables
+colSums(is.na(lego[, c("Amazon_Price", "Theme", "Pieces",
+                       "Minifigures", "Unique_Pieces")]))
+```
+
+#### 1.2 Cleaning LEGO Theme Names
+
+```{r}
+# Save the original theme names in case we need them later
+lego$Theme_Original <- lego$Theme
+
+# Convert theme names to plain ASCII text
+# This removes problematic special characters
+lego$Theme <- iconv(
+  lego$Theme,
+  from = "latin1",
+  to = "ASCII",
+  sub = ""
+)
+
+# Remove any extra spaces
+lego$Theme <- trimws(lego$Theme)
+
+# Check the most common themes after cleaning
+head(sort(table(lego$Theme), decreasing = TRUE), 15)
+```
+
+### 2. Theme Analysis
+
+#### 2.1 Number of LEGO Sets by Theme
+
+```{r}
+# Count how many LEGO sets belong to each theme
+theme_counts <- sort(table(lego$Theme), decreasing = TRUE)
+
+# Display the 15 most common themes
+head(theme_counts, 15)
+```
+
+#### 2.2 LEGO Theme Prevalence — Word Cloud
+
+```{r}
+library(wordcloud)
+
+# Count LEGO sets by theme
+theme_counts <- sort(table(lego$Theme), decreasing = TRUE)
+
+# Create clean theme names for the word cloud
+theme_names <- iconv(
+  names(theme_counts),
+  from = "latin1",
+  to = "ASCII",
+  sub = ""
+)
+
+# Create the word cloud
+set.seed(470)
+
+wordcloud(
+  words = theme_names,
+  freq = as.numeric(theme_counts),
+  min.freq = 2,
+  max.words = 30,
+  random.order = FALSE,
+  rot.per = 0,
+  scale = c(3.5, 0.7),
+  colors = c(
+    "#1F77B4",  # Blue
+    "#FF7F0E",  # Orange
+    "#2CA02C",  # Green
+    "#D62728",  # Red
+    "#9467BD",  # Purple
+    "#17BECF",  # Teal
+    "#E377C2",  # Pink
+    "#BCBD22",  # Olive
+    "#8C564B",  # Brown
+    "#E6A23C",  # Gold
+    "#264653",  # Dark teal
+    "#E76F51"   # Coral
+  ),
+  ordered.colors = FALSE
+)
+```
+
+#### 2.3 Median Amazon Price by LEGO Theme
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Calculate median Amazon price and number of priced sets by theme
+theme_prices <- lego |>
+  filter(!is.na(Theme), !is.na(Amazon_Price)) |>
+  group_by(Theme) |>
+  summarise(
+    n = n(),
+    median_price = median(Amazon_Price),
+    .groups = "drop"
+  ) |>
+  filter(n >= 10)
+
+# Plot median Amazon price for themes with at least 10 priced sets
+ggplot(theme_prices,
+       aes(x = reorder(Theme, median_price), y = median_price)) +
+  geom_col(fill = "#2878B5") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Median Amazon Price by LEGO Theme",
+    subtitle = "Themes with at least 10 sets with available Amazon prices",
+    x = "LEGO Theme",
+    y = "Median Amazon Price"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 2.4 LEGO Theme and Amazon Price Distribution — Heat Map
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Keep sets with known themes and Amazon prices
+theme_heatmap <- lego |>
+  filter(!is.na(Theme), !is.na(Amazon_Price)) |>
+
+  # Group Amazon prices into ranges
+  mutate(
+    Price_Range = cut(
+      Amazon_Price,
+      breaks = c(0, 25, 50, 100, 200, Inf),
+      labels = c("$0–25", "$25–50", "$50–100",
+                 "$100–200", "$200+"),
+      include.lowest = TRUE
+    )
+  ) |>
+
+  # Count sets in each theme and price range
+  count(Theme, Price_Range, name = "Count") |>
+
+  # Keep themes with at least 10 sets with known prices
+  group_by(Theme) |>
+  filter(sum(Count) >= 10) |>
+  ungroup()
+
+# Create heat map
+ggplot(
+  theme_heatmap,
+  aes(
+    x = Price_Range,
+    y = reorder(Theme, Count, FUN = sum),
+    fill = Count
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient(
+    low = "#EAF3F8",
+    high = "#145A86"
+  ) +
+  labs(
+    title = "LEGO Theme Distribution Across Amazon Price Ranges",
+    subtitle = "Number of sets in each theme and price category",
+    x = "Amazon Price Range",
+    y = "LEGO Theme",
+    fill = "Number of Sets"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+### 2.5 Percentage Distribution of Amazon Prices Within Each LEGO Theme
+
+```{r}
+# Calculate the percentage of sets in each price range within each theme
+theme_heatmap_pct <- theme_heatmap |>
+  group_by(Theme) |>
+  mutate(
+    Percentage = 100 * Count / sum(Count)
+  ) |>
+  ungroup()
+
+# Create percentage-based heat map
+ggplot(
+  theme_heatmap_pct,
+  aes(
+    x = Price_Range,
+    y = reorder(Theme, Percentage, FUN = max),
+    fill = Percentage
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient(
+    low = "#EAF3F8",
+    high = "#145A86",
+    limits = c(0, 100),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    title = "Amazon Price Distribution Within Each LEGO Theme",
+    subtitle = "Percentage of priced sets in each price range",
+    x = "Amazon Price Range",
+    y = "LEGO Theme",
+    fill = "Percentage"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+### 3. Pieces Analysis
+
+#### 3.1 Distribution of LEGO Piece Counts
+
+```{r}
+# Summary statistics for the number of pieces
+summary(lego$Pieces)
+
+# Histogram showing the distribution of piece counts
+ggplot(lego, aes(x = Pieces)) +
+  geom_histogram(
+    bins = 40,
+    fill = "#2878B5",
+    color = "white"
+  ) +
+  scale_x_continuous(
+    labels = scales::label_comma()
+  ) +
+  labs(
+    title = "Distribution of LEGO Set Piece Counts",
+    subtitle = "Number of pieces per LEGO set",
+    x = "Number of Pieces",
+    y = "Number of LEGO Sets"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 3.2 Relationship Between Pieces and Amazon Price
+
+```{r}
+# Keep sets with known piece counts and Amazon prices
+pieces_price <- lego |>
+  filter(!is.na(Pieces), !is.na(Amazon_Price))
+
+# Calculate the Pearson correlation
+cor(pieces_price$Pieces, pieces_price$Amazon_Price)
+
+# Scatterplot of piece count and Amazon price
+ggplot(pieces_price, aes(x = Pieces, y = Amazon_Price)) +
+  geom_point(
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Relationship Between LEGO Pieces and Amazon Price",
+    subtitle = "Scatterplot with fitted linear trend",
+    x = "Number of Pieces",
+    y = "Amazon Price"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 3.3 Log-Log Relationship Between Pieces and Amazon Price
+
+```{r}
+# Keep observations with positive piece counts and Amazon prices
+pieces_price_log <- pieces_price |>
+  filter(Pieces > 0, Amazon_Price > 0)
+
+# Create a scatterplot with logarithmic axes
+ggplot(
+  pieces_price_log,
+  aes(x = Pieces, y = Amazon_Price)
+) +
+  geom_point(
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_log10(
+    labels = scales::label_comma()
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar()
+  ) +
+  labs(
+    title = "LEGO Pieces vs. Amazon Price (Log-Log Scale)",
+    subtitle = "Logarithmic axes highlight patterns across set sizes",
+    x = "Number of Pieces (Log Scale)",
+    y = "Amazon Price (Log Scale)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 4. Minifigures Analysis
+
+#### 4.1 Distribution of LEGO Minifigure Counts
+
+```{r}
+# Summary statistics for the number of minifigures
+summary(lego$Minifigures)
+
+# Count how many sets have each recorded minifigure count
+table(lego$Minifigures, useNA = "ifany")
+
+# Create a histogram of minifigure counts
+ggplot(
+  lego |> filter(!is.na(Minifigures)),
+  aes(x = Minifigures)
+) +
+  geom_histogram(
+    binwidth = 1,
+    boundary = -0.5,
+    fill = "#2878B5",
+    color = "white"
+  ) +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  labs(
+    title = "Distribution of LEGO Minifigure Counts",
+    subtitle = "Sets with recorded minifigure counts",
+    x = "Number of Minifigures",
+    y = "Number of LEGO Sets"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 4.2 Relationship Between Minifigures and Amazon Price
+
+```{r}
+# Keep sets with known minifigure counts and Amazon prices
+minifig_price <- lego |>
+  filter(!is.na(Minifigures), !is.na(Amazon_Price))
+
+# Calculate Pearson correlation
+cor(minifig_price$Minifigures, minifig_price$Amazon_Price)
+
+# Create a scatterplot with slight horizontal jitter
+set.seed(470)
+
+ggplot(minifig_price, aes(x = Minifigures, y = Amazon_Price)) +
+  geom_jitter(
+    width = 0.2,
+    height = 0,
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Relationship Between LEGO Minifigures and Amazon Price",
+    subtitle = "Recorded minifigure counts with fitted linear trend",
+    x = "Number of Minifigures",
+    y = "Amazon Price"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 5. Unique Pieces Analysis
+
+#### 5.1 Distribution of Unique LEGO Piece Counts
+
+```{r}
+# Summary statistics for unique piece counts
+summary(lego$Unique_Pieces)
+
+# Create a histogram of unique piece counts
+ggplot(
+  lego |> filter(!is.na(Unique_Pieces)),
+  aes(x = Unique_Pieces)
+) +
+  geom_histogram(
+    bins = 40,
+    fill = "#2878B5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Distribution of Unique LEGO Piece Counts",
+    subtitle = "Number of distinct piece types per LEGO set",
+    x = "Number of Unique Pieces",
+    y = "Number of LEGO Sets"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 5.2 Relationship Between Unique Pieces and Amazon Price
+
+```{r}
+# Keep sets with known unique piece counts and Amazon prices
+unique_price <- lego |>
+  filter(!is.na(Unique_Pieces), !is.na(Amazon_Price))
+
+# Calculate Pearson correlation between unique pieces and Amazon price
+cor(unique_price$Unique_Pieces, unique_price$Amazon_Price)
+
+# Create a scatterplot with a fitted linear trend
+ggplot(
+  unique_price,
+  aes(x = Unique_Pieces, y = Amazon_Price)
+) +
+  geom_point(
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Relationship Between Unique Pieces and Amazon Price",
+    subtitle = "Scatterplot with fitted linear trend",
+    x = "Number of Unique Pieces",
+    y = "Amazon Price"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 5.3 Relationship Between Total Pieces and Unique Pieces
+
+```{r}
+# Keep sets with both piece counts available
+pieces_unique <- lego |>
+  filter(!is.na(Pieces), !is.na(Unique_Pieces))
+
+# Calculate the Pearson correlation
+cor(pieces_unique$Pieces, pieces_unique$Unique_Pieces)
+
+# Visualize the relationship
+ggplot(
+  pieces_unique,
+  aes(x = Pieces, y = Unique_Pieces)
+) +
+  geom_point(
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Relationship Between Total Pieces and Unique Pieces",
+    subtitle = "Exploring the association between two potential price predictors",
+    x = "Number of Pieces",
+    y = "Number of Unique Pieces"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+#### 5.4 Log-Log Relationship Between Unique Pieces and Amazon Price
+
+```{r}
+# Keep observations with positive unique piece counts and Amazon prices
+unique_price_log <- unique_price |>
+  filter(Unique_Pieces > 0, Amazon_Price > 0)
+
+# Create a log-log scatterplot
+ggplot(
+  unique_price_log,
+  aes(x = Unique_Pieces, y = Amazon_Price)
+) +
+  geom_point(
+    color = "#2878B5",
+    alpha = 0.5,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    color = "#E76F51",
+    linewidth = 1
+  ) +
+  scale_x_log10(
+    labels = scales::label_comma()
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar()
+  ) +
+  labs(
+    title = "Unique LEGO Pieces vs. Amazon Price (Log-Log Scale)",
+    subtitle = "Logarithmic axes highlight relationships across set sizes",
+    x = "Number of Unique Pieces (Log Scale)",
+    y = "Amazon Price (Log Scale)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 6. Additional Data Quality Investigation
+
+#### 6.1 Missing Minifigure Counts by LEGO Theme
+
+```{r}
+# Calculate missing minifigure counts by theme
+minifig_missing <- lego |>
+  filter(!is.na(Theme)) |>
+  group_by(Theme) |>
+  summarise(
+    Total_Sets = n(),
+    Missing_Minifigures = sum(is.na(Minifigures)),
+    Missing_Percent = 100 * mean(is.na(Minifigures)),
+    .groups = "drop"
+  ) |>
+  filter(Total_Sets >= 10) |>
+  arrange(desc(Missing_Percent))
+
+# Display missingness by theme
+print(minifig_missing, n = Inf)
+
+# Visualize missingness
+ggplot(
+  minifig_missing,
+  aes(x = reorder(Theme, Missing_Percent), y = Missing_Percent)
+) +
+  geom_col(fill = "#2878B5") +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    title = "Missing Minifigure Data by LEGO Theme",
+    subtitle = "Themes with at least 10 sets",
+    x = "LEGO Theme",
+    y = "Percentage Missing"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 7. Summary of Exploratory Findings
+
+#### Theme
+
+-   LEGO themes differ considerably in their typical Amazon prices. Creator Expert has the highest median price among the themes analyzed, while DOTS and Classic are among the lowest.
+
+-   The word cloud shows that Star Wars, Friends, City, and NINJAGO are the most prevalent themes in the dataset.
+
+-   The percentage-based heat map reveals that Amazon price distributions vary across themes, suggesting that Theme may be useful for predicting price.
+
+#### Pieces
+
+-   Total piece counts are strongly right-skewed, with a median of 198 pieces and a maximum of 6,020.
+
+-   Pieces has a strong positive correlation with Amazon Price (r = 0.8117).
+
+-   The log-log scatterplot shows an approximately linear positive relationship, suggesting that logarithmic transformations may be worth exploring during modeling.
+
+#### Minifigures
+
+-   Recorded minifigure counts are right-skewed, with a median of 2 and a maximum of 28.
+
+-   Minifigures has a moderate positive correlation with Amazon Price (r = 0.5618).
+
+-   Missing minifigure data is strongly associated with Theme. Several themes have 100% missing values, indicating that missingness may reflect differences in set characteristics or data collection.
+
+#### Unique Pieces
+
+-   Unique piece counts are right-skewed, with a median of 83 and a maximum of 1,067.
+
+-   Unique_Pieces has a strong positive correlation with Amazon Price (r = 0.7061).
+
+-   Pieces and Unique_Pieces are also strongly correlated (r = 0.7794), suggesting that they may contain overlapping predictive information.
+
+#### Overall Conclusions
+
+-   All three numerical variables examined have positive associations with Amazon Price, with Pieces showing the strongest pairwise linear correlation.
+
+-   Theme also appears to be associated with price, although differences may partly reflect variation in set sizes.
+
+-   Missing data, especially for Amazon_Price and Minifigures, will require careful consideration during predictive modeling.
+
+-   Future modeling should evaluate whether Theme, Minifigures, and Unique_Pieces improve price predictions beyond what can be achieved using total piece count alone.
