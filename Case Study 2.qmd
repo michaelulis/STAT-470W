@@ -8,6 +8,10 @@ editor: visual
 
 ### Libraries
 
+```{r}
+library(tidyverse)
+```
+
 ### Data Set
 
 ```{r}
@@ -26,39 +30,30 @@ View(lego)
 
 ```{r}
 ## EDA — Theme, Pieces, Minifigures, and Unique Pieces
-
 ### Data Preparation
-
 # Convert Amazon_Price from text (e.g., "$19.99") to a number
 lego$Amazon_Price <- as.numeric(gsub("[$,]", "", lego$Amazon_Price))
-
 # Check the structure of the variables we will analyze
 str(lego[, c("Amazon_Price", "Theme", "Pieces",
              "Minifigures", "Unique_Pieces")])
-
 # Count missing values in our variables
 colSums(is.na(lego[, c("Amazon_Price", "Theme", "Pieces",
                        "Minifigures", "Unique_Pieces")]))
 ```
-
 #### 1.2 Cleaning LEGO Theme Names
-
 ```{r}
 # Save the original theme names in case we need them later
 lego$Theme_Original <- lego$Theme
-
 # Convert theme names to plain ASCII text
 # This removes problematic special characters
 lego$Theme <- iconv(
   lego$Theme,
-  from = "latin1",
+  from = "",
   to = "ASCII",
   sub = ""
 )
-
 # Remove any extra spaces
 lego$Theme <- trimws(lego$Theme)
-
 # Check the most common themes after cleaning
 head(sort(table(lego$Theme), decreasing = TRUE), 15)
 ```
@@ -647,8 +642,7 @@ ggplot(
 
 ```{r}
 # Check the structure of the variables we will analyze
-remove(list = ls())
-case2 <- read.csv("~/Downloads/case-study2-data.csv", comment.char="#")
+case2 <- lego
 
 str(case2[, c("Pages", "Packaging", "Weight",
              "Size", "Availability")])
@@ -851,3 +845,495 @@ ggplot(filter(case2, !is.na(Size)),
 ## Pieces and Pages are also highly correlated, which Michael touches on.
 
 ## Size reflects size of bricks, not the size of the set.
+
+# Exploratory Data Analysis: Year, Ages, Price, and Amazon
+
+### 1. Data preparation and quality checks
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# The supplied CSV uses Latin-1 text, including the one-half symbol in Ages.
+# Read a fresh copy so this section can also run independently of earlier EDA.
+lego_eda <- readr::read_csv(
+  "case-study2-data.csv",
+  locale = readr::locale(encoding = "Latin1"),
+  na = c("", "NA", "N/A"),
+  show_col_types = FALSE
+)
+
+required_columns <- c("Item_Number", "Set_Name", "Theme", "Year", "Ages",
+                      "Price", "Amazon_Price", "Pieces", "Pages",
+                      "Minifigures", "Unique_Pieces", "Availability")
+stopifnot(all(required_columns %in% names(lego_eda)))
+
+# Convert dollar strings to numbers, retaining original strings for auditing.
+money_to_numeric <- function(x) {
+  as.numeric(gsub("[$,[:space:]]", "", as.character(x)))
+}
+
+lego_eda <- lego_eda |>
+  mutate(
+    Price_Original = Price,
+    Amazon_Price_Original = Amazon_Price,
+    Price = money_to_numeric(Price),
+    Amazon_Price = money_to_numeric(Amazon_Price),
+    Year = as.integer(Year),
+    Year_Group = factor(Year, levels = sort(unique(Year))),
+    Amazon_Observed = !is.na(Amazon_Price),
+    Amazon_Status = factor(
+      if_else(Amazon_Observed, "Observed", "Missing"),
+      levels = c("Observed", "Missing")
+    )
+  )
+
+# Normalize Ages_6 - 12 to 6-12 and convert 1 1/2 (the half symbol) to 1.5.
+# Ages_NA is a missing age recommendation, not an actual age category.
+lego_eda$Ages_Clean <- trimws(sub("^Ages_", "", lego_eda$Ages))
+lego_eda$Ages_Clean <- gsub("[[:space:]]", "", lego_eda$Ages_Clean)
+lego_eda$Ages_Clean <- gsub("\u00bd", ".5", lego_eda$Ages_Clean, fixed = TRUE)
+lego_eda$Ages_Clean[lego_eda$Ages_Clean %in% c("", "NA", "N/A")] <- NA_character_
+
+# A '+' label has a lower age recommendation but no stated upper bound.
+# Do not replace the absent upper bound with an arbitrary age.
+age_pattern <- "^[0-9]+(\\.[0-9]+)?(\\+|-[0-9]+(\\.[0-9]+)?)$"
+age_parse_issues <- lego_eda |>
+  filter(!is.na(Ages_Clean), !grepl(age_pattern, Ages_Clean)) |>
+  distinct(Ages, Ages_Clean)
+print(age_parse_issues)
+if (nrow(age_parse_issues) > 0) {
+  stop("Unrecognized Ages labels: inspect age_parse_issues before continuing.")
+}
+
+lego_eda <- lego_eda |>
+  mutate(
+    Age_Min = as.numeric(sub("[+-].*$", "", Ages_Clean)),
+    Age_Max = as.numeric(if_else(
+      grepl("-", Ages_Clean), sub("^.*-", "", Ages_Clean), NA_character_
+    )),
+    Age_Format = case_when(
+      is.na(Ages_Clean) ~ "Missing recommendation",
+      grepl("+", Ages_Clean, fixed = TRUE) ~ "Minimum age (+)",
+      TRUE ~ "Age range"
+    )
+  )
+
+# Order full age labels by their lower bound, then their upper bound.
+age_levels <- lego_eda |>
+  filter(!is.na(Ages_Clean)) |>
+  distinct(Ages_Clean, Age_Min, Age_Max) |>
+  arrange(Age_Min, Age_Max, Ages_Clean) |>
+  pull(Ages_Clean)
+lego_eda$Age_Label <- factor(lego_eda$Ages_Clean, levels = age_levels)
+lego_eda$Age_Min_Group <- factor(
+  lego_eda$Age_Min, levels = sort(unique(na.omit(lego_eda$Age_Min)))
+)
+
+# Missingness across the ORIGINAL variables, with Ages_NA treated as missing.
+missing_values <- vapply(lego_eda[seq_len(15)], function(x) sum(is.na(x)), integer(1))
+missing_values["Ages"] <- sum(is.na(lego_eda$Ages_Clean))
+missing_summary <- tibble(
+  Variable = names(missing_values),
+  Missing = unname(missing_values),
+  Percent_Missing = 100 * Missing / nrow(lego_eda)
+) |>
+  arrange(desc(Percent_Missing))
+print(missing_summary, n = Inf)
+
+# Report potential problems without silently deleting sets or outliers.
+quality_checks <- tibble(
+  Check = c("Duplicate full rows", "Duplicate item numbers",
+            "LEGO prices that did not parse", "Amazon prices that did not parse",
+            "Nonpositive LEGO prices", "Nonpositive Amazon prices",
+            "Years outside 2018-2020", "Age ranges with upper < lower",
+            "Unique pieces greater than total pieces"),
+  Count = c(
+    sum(duplicated(lego_eda[seq_len(15)])),
+    sum(duplicated(lego_eda$Item_Number)),
+    sum(!is.na(lego_eda$Price_Original) & is.na(lego_eda$Price)),
+    sum(!is.na(lego_eda$Amazon_Price_Original) & is.na(lego_eda$Amazon_Price)),
+    sum(lego_eda$Price <= 0, na.rm = TRUE),
+    sum(lego_eda$Amazon_Price <= 0, na.rm = TRUE),
+    sum(!is.na(lego_eda$Year) & !lego_eda$Year %in% 2018:2020),
+    sum(lego_eda$Age_Max < lego_eda$Age_Min, na.rm = TRUE),
+    sum(lego_eda$Unique_Pieces > lego_eda$Pieces, na.rm = TRUE)
+  )
+)
+print(quality_checks, n = Inf)
+
+# A reusable summary that handles groups with no observed values.
+numeric_summary <- function(x) {
+  observed <- x[is.finite(x)]
+  q <- if (length(observed) > 0) {
+    quantile(observed, c(0, 0.25, 0.5, 0.75, 1), names = FALSE)
+  } else {
+    rep(NA_real_, 5)
+  }
+  tibble(
+    N_Observed = length(observed), N_Missing = sum(is.na(x)),
+    Mean = if (length(observed) > 0) mean(observed) else NA_real_,
+    SD = if (length(observed) > 1) sd(observed) else NA_real_,
+    Minimum = q[1], Q1 = q[2], Median = q[3], Q3 = q[4], Maximum = q[5]
+  )
+}
+
+eda_blue <- "#2878B5"
+eda_orange <- "#E76F51"
+```
+
+### 2. Year
+
+```{r}
+# 2020 ends on September 11; its count does not describe a full calendar year.
+year_summary <- lego_eda |>
+  group_by(Year) |>
+  summarise(
+    Total_Sets = n(),
+    Priced_Sets = sum(Amazon_Observed),
+    Percent_Amazon_Missing = 100 * mean(!Amazon_Observed),
+    .groups = "drop"
+  )
+print(year_summary)
+
+ggplot(year_summary, aes(x = factor(Year), y = Total_Sets)) +
+  geom_col(fill = eda_blue) +
+  geom_text(aes(label = Total_Sets), vjust = -0.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.10))) +
+  labs(title = "Number of LEGO sets by release year",
+       subtitle = "2020 includes sets only through September 11",
+       x = "Release year", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+year_price_summary <- lego_eda |>
+  group_by(Year) |>
+  group_modify(~ numeric_summary(.x$Amazon_Price)) |>
+  ungroup()
+print(year_price_summary)
+
+ggplot(filter(lego_eda, !is.na(Amazon_Price)),
+       aes(x = Year_Group, y = Amazon_Price)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(title = "Amazon price by release year",
+       subtitle = "Observed prices only; differences may reflect the mix of sets",
+       x = "Release year", y = "Amazon price") +
+  theme_minimal(base_size = 12)
+
+ggplot(filter(lego_eda, Amazon_Price > 0),
+       aes(x = Year_Group, y = Amazon_Price)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  labs(title = "Amazon price by release year (log scale)",
+       x = "Release year", y = "Amazon price (log scale)") +
+  theme_minimal(base_size = 12)
+
+ggplot(lego_eda, aes(x = Year_Group, fill = Amazon_Status)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("Observed" = eda_blue, "Missing" = eda_orange)) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(title = "Amazon price completeness by release year",
+       x = "Release year", y = "Proportion of sets", fill = "Amazon price") +
+  theme_minimal(base_size = 12)
+```
+
+### 3. Ages
+
+```{r}
+# Preserve the full labels as well as the numeric minimum recommendation.
+# For example, 6-12 and 6+ share a minimum but convey different recommendations.
+age_counts <- lego_eda |>
+  count(Age_Label, name = "Sets", .drop = FALSE)
+print(age_counts, n = Inf)
+print(count(lego_eda, Age_Format, name = "Sets"))
+print(numeric_summary(lego_eda$Age_Min))
+
+ggplot(filter(age_counts, !is.na(Age_Label)),
+       aes(x = Age_Label, y = Sets)) +
+  geom_col(fill = eda_blue) +
+  coord_flip() +
+  labs(title = "LEGO age recommendations",
+       subtitle = "Full labels retained; missing recommendations are counted in the table",
+       x = "Recommended ages (years)", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+age_price_summary <- lego_eda |>
+  group_by(Age_Min) |>
+  group_modify(~ numeric_summary(.x$Amazon_Price)) |>
+  ungroup()
+print(age_price_summary, n = Inf)
+
+ggplot(filter(lego_eda, !is.na(Age_Min), Amazon_Price > 0),
+       aes(x = Age_Min_Group, y = Amazon_Price)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  labs(title = "Amazon price by minimum recommended age",
+       subtitle = "Groups combine range and '+' labels with the same minimum age",
+       x = "Minimum recommended age (years)", y = "Amazon price (log scale)") +
+  theme_minimal(base_size = 12)
+
+# Set size can help explain an apparent association between age and price.
+ggplot(filter(lego_eda, !is.na(Age_Min), Pieces > 0),
+       aes(x = Age_Min_Group, y = Pieces)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(title = "Piece count by minimum recommended age",
+       x = "Minimum recommended age (years)", y = "Number of pieces (log scale)") +
+  theme_minimal(base_size = 12)
+
+# Some full age labels may be concentrated in specific release years.
+age_year_counts <- lego_eda |>
+  filter(!is.na(Age_Label)) |>
+  count(Year_Group, Age_Label, name = "Sets", .drop = FALSE)
+ggplot(age_year_counts, aes(x = Year_Group, y = Age_Label, fill = Sets)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#EAF3F8", high = "#145A86") +
+  labs(title = "Age recommendation labels by release year",
+       x = "Release year", y = "Recommended ages (years)", fill = "Sets") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+### 4. Price: LEGO recommended retail price
+
+```{r}
+# Price is descriptive here. The assignment excludes it as a covariate in an
+# Amazon-price prediction model. A later fitted model could be evaluated on
+# LEGO prices as a separate generalizability check.
+print(numeric_summary(lego_eda$Price))
+
+ggplot(filter(lego_eda, !is.na(Price)), aes(x = Price)) +
+  geom_histogram(bins = 35, fill = eda_blue, color = "white") +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(title = "Distribution of LEGO recommended prices",
+       x = "LEGO recommended price", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+ggplot(filter(lego_eda, Price > 0), aes(x = Price)) +
+  geom_histogram(bins = 30, fill = eda_blue, color = "white") +
+  scale_x_log10(labels = scales::label_dollar()) +
+  labs(title = "LEGO recommended prices (log scale)",
+       x = "LEGO recommended price (log scale)", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+lego_year_price_summary <- lego_eda |>
+  group_by(Year) |>
+  group_modify(~ numeric_summary(.x$Price)) |>
+  ungroup()
+print(lego_year_price_summary)
+
+ggplot(filter(lego_eda, Price > 0), aes(x = Year_Group, y = Price)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  labs(title = "LEGO recommended price by release year",
+       x = "Release year", y = "LEGO recommended price (log scale)") +
+  theme_minimal(base_size = 12)
+```
+
+### 5. Amazon: response distribution and descriptive price comparisons
+
+```{r}
+print(numeric_summary(lego_eda$Amazon_Price))
+print(count(lego_eda, Amazon_Status, name = "Sets"))
+
+ggplot(filter(lego_eda, !is.na(Amazon_Price)), aes(x = Amazon_Price)) +
+  geom_histogram(bins = 35, fill = eda_blue, color = "white") +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(title = "Distribution of Amazon prices",
+       x = "Amazon price", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+ggplot(filter(lego_eda, Amazon_Price > 0), aes(x = Amazon_Price)) +
+  geom_histogram(bins = 30, fill = eda_blue, color = "white") +
+  scale_x_log10(labels = scales::label_dollar()) +
+  labs(title = "Distribution of Amazon prices (log scale)",
+       x = "Amazon price (log scale)", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+
+# Restrict comparisons to the SAME sets with both prices observed.
+# Comparing overall means would mix two differently observed samples.
+paired_prices <- lego_eda |>
+  filter(Price > 0, Amazon_Price > 0) |>
+  mutate(
+    Amazon_Minus_LEGO = Amazon_Price - Price,
+    Percent_Discount = 100 * (Price - Amazon_Price) / Price,
+    Amazon_to_LEGO = Amazon_Price / Price,
+    Price_Comparison = case_when(
+      abs(Amazon_Minus_LEGO) < 0.005 ~ "Same price",
+      Amazon_Minus_LEGO < 0 ~ "Amazon cheaper",
+      TRUE ~ "Amazon more expensive"
+    )
+  )
+
+paired_summary <- bind_rows(
+  numeric_summary(paired_prices$Price) |> mutate(Variable = "LEGO price"),
+  numeric_summary(paired_prices$Amazon_Price) |> mutate(Variable = "Amazon price"),
+  numeric_summary(paired_prices$Amazon_Minus_LEGO) |> mutate(Variable = "Amazon minus LEGO ($)"),
+  numeric_summary(paired_prices$Percent_Discount) |> mutate(Variable = "Discount (%)"),
+  numeric_summary(paired_prices$Amazon_to_LEGO) |> mutate(Variable = "Amazon / LEGO ratio")
+) |>
+  relocate(Variable)
+print(paired_summary, width = Inf)
+
+price_comparison_counts <- paired_prices |>
+  count(Price_Comparison, name = "Sets") |>
+  mutate(Percent = 100 * Sets / sum(Sets))
+print(price_comparison_counts)
+
+ggplot(paired_prices, aes(x = Price, y = Amazon_Price, color = Year_Group)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey35") +
+  geom_point(alpha = 0.55) +
+  scale_x_log10(labels = scales::label_dollar()) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  coord_fixed() +
+  labs(title = "Amazon versus LEGO recommended price",
+       subtitle = "Dashed line: equal prices; above the line: Amazon more expensive",
+       x = "LEGO recommended price (log scale)",
+       y = "Amazon price (log scale)", color = "Release year") +
+  theme_minimal(base_size = 12)
+
+ggplot(paired_prices, aes(x = Percent_Discount)) +
+  geom_histogram(bins = 35, fill = eda_blue, color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = eda_orange) +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Amazon discount relative to LEGO recommended price",
+       subtitle = "Positive = cheaper on Amazon; negative = more expensive on Amazon",
+       x = "Percent discount", y = "Number of paired sets") +
+  theme_minimal(base_size = 12)
+
+discount_year_summary <- paired_prices |>
+  group_by(Year) |>
+  group_modify(~ numeric_summary(.x$Percent_Discount)) |>
+  ungroup()
+print(discount_year_summary)
+```
+
+### 6. Additional missingness, outlier, and predictor checks
+
+```{r}
+ggplot(missing_summary, aes(x = reorder(Variable, Percent_Missing), y = Percent_Missing)) +
+  geom_col(fill = eda_orange) +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Missing data across the original variables",
+       subtitle = "Ages_NA is counted as missing; Minifigures NA has ambiguous meaning",
+       x = "Variable", y = "Percentage missing") +
+  theme_minimal(base_size = 12)
+
+# Does price availability differ by observed set characteristics?
+# This is a descriptive selection check, not proof of a missingness mechanism.
+amazon_missing_by_age <- lego_eda |>
+  group_by(Age_Min) |>
+  summarise(Total_Sets = n(), Missing = sum(!Amazon_Observed),
+            Percent_Missing = 100 * mean(!Amazon_Observed), .groups = "drop")
+print(amazon_missing_by_age, n = Inf)
+
+amazon_missing_by_availability <- lego_eda |>
+  group_by(Availability) |>
+  summarise(Total_Sets = n(), Missing = sum(!Amazon_Observed),
+            Percent_Missing = 100 * mean(!Amazon_Observed), .groups = "drop") |>
+  arrange(desc(Percent_Missing))
+print(amazon_missing_by_availability, n = Inf)
+
+amazon_missing_by_theme <- lego_eda |>
+  group_by(Theme) |>
+  summarise(Total_Sets = n(), Missing = sum(!Amazon_Observed),
+            Percent_Missing = 100 * mean(!Amazon_Observed), .groups = "drop") |>
+  filter(Total_Sets >= 10) |>
+  arrange(desc(Percent_Missing))
+print(amazon_missing_by_theme, n = Inf)
+
+selection_summary <- lego_eda |>
+  group_by(Amazon_Status) |>
+  summarise(
+    Total_Sets = n(),
+    N_Pieces = sum(!is.na(Pieces)),
+    Median_Pieces = median(Pieces, na.rm = TRUE),
+    N_LEGO_Price = sum(!is.na(Price)),
+    Median_LEGO_Price = median(Price, na.rm = TRUE),
+    N_Age = sum(!is.na(Age_Min)),
+    Median_Age_Min = median(Age_Min, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(selection_summary, width = Inf)
+
+ggplot(filter(lego_eda, Pieces > 0), aes(x = Amazon_Status, y = Pieces)) +
+  geom_boxplot(fill = eda_blue, alpha = 0.6) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(title = "Set sizes when Amazon price is observed versus missing",
+       x = "Amazon price status", y = "Number of pieces (log scale)") +
+  theme_minimal(base_size = 12)
+
+# Flag unusual response values using the 1.5 * IQR rule; keep them in the data.
+# In a skewed price distribution these can be valid expensive sets.
+amazon_quartiles <- quantile(lego_eda$Amazon_Price, c(0.25, 0.75), na.rm = TRUE)
+amazon_iqr <- diff(amazon_quartiles)
+lower_fence <- unname(amazon_quartiles[1] - 1.5 * amazon_iqr)
+upper_fence <- unname(amazon_quartiles[2] + 1.5 * amazon_iqr)
+amazon_outliers <- lego_eda |>
+  filter(Amazon_Price < lower_fence | Amazon_Price > upper_fence) |>
+  arrange(desc(Amazon_Price)) |>
+  select(Item_Number, Set_Name, Theme, Year, Ages_Clean, Pieces, Price, Amazon_Price)
+print(tibble(Lower_Fence = lower_fence, Upper_Fence = upper_fence,
+             Flagged_Sets = nrow(amazon_outliers)))
+print(head(amazon_outliers, 10), width = Inf)
+
+# Correlations between response and potential numeric predictors.
+# Year is summarized as a categorical variable above. Price is deliberately
+# absent here because it cannot enter the assignment's prediction model.
+numeric_variables <- c("Amazon_Price", "Age_Min", "Pieces", "Pages",
+                       "Minifigures", "Unique_Pieces")
+numeric_data <- lego_eda[numeric_variables]
+pearson_correlations <- cor(numeric_data, use = "pairwise.complete.obs", method = "pearson")
+spearman_correlations <- cor(numeric_data, use = "pairwise.complete.obs", method = "spearman")
+pairwise_n <- crossprod(!is.na(as.matrix(numeric_data)))
+print(round(pearson_correlations, 3))
+print(round(spearman_correlations, 3))
+print(pairwise_n)
+
+correlation_plot_data <- as.data.frame(as.table(spearman_correlations))
+names(correlation_plot_data) <- c("Variable_1", "Variable_2", "Correlation")
+ggplot(correlation_plot_data, aes(x = Variable_1, y = Variable_2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3.5) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                       midpoint = 0, limits = c(-1, 1)) +
+  coord_fixed() +
+  labs(title = "Spearman correlations among numeric variables",
+       subtitle = "Pairwise available observations; sample sizes are in the table",
+       x = NULL, y = NULL, fill = "Correlation") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1), panel.grid = element_blank())
+
+# Pages versus Pieces was mentioned in the draft but had no matching plot.
+ggplot(filter(lego_eda, Pieces > 0, Pages > 0), aes(x = Pieces, y = Pages)) +
+  geom_point(alpha = 0.45, color = eda_blue) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = eda_orange) +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(title = "Instruction pages versus total piece count",
+       subtitle = "The fitted line is an exploratory trend on the log-log scale",
+       x = "Number of pieces (log scale)", y = "Instruction pages (log scale)") +
+  theme_minimal(base_size = 12)
+
+# Minifigures NA can indicate either zero figures or genuinely missing data.
+# Keep NA as missing here; do not automatically replace every NA with zero.
+# No values are imputed, and no outliers are removed by this script.
+```
+
+### Interpretation notes
+
+- Year is a release-year category. The 2020 sample ends on September 11, so raw counts do not measure a full year of production.
+- Ages are set recommendations, not ages of purchasers. Minimum-age plots combine ranges and '+' labels; the full-label plots preserve that distinction.
+- Amazon price summaries use observed prices. Missingness comparisons help assess whether the priced subset differs from other sets.
+- Positive discounts mean Amazon is cheaper than LEGO's recommended price. The comparison uses only sets with both prices observed.
+- Price outliers are flagged for review and remain in the analysis. Raw and log scales show different aspects of the distribution.
+- Pairwise correlations use different numbers of observations. Their sample sizes are reported alongside the correlation tables.
+- Minifigures recorded as NA can mean either no minifigures or missing data; they are not automatically changed to zero.
+- These are exploratory associations. Formal modeling and a fitted-model generalizability check remain separate steps.
+
+
+
+
+
