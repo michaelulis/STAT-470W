@@ -642,3 +642,212 @@ ggplot(
 -   Missing data, especially for Amazon_Price and Minifigures, will require careful consideration during predictive modeling.
 
 -   Future modeling should evaluate whether Theme, Minifigures, and Unique_Pieces improve price predictions beyond what can be achieved using total piece count alone.
+
+#### EDA of Pages, Weight, Packages, Size, Availability (Thaddeus)
+
+```{r}
+# Check the structure of the variables we will analyze
+remove(list = ls())
+case2 <- read.csv("~/Downloads/case-study2-data.csv", comment.char="#")
+
+str(case2[, c("Pages", "Packaging", "Weight",
+             "Size", "Availability")])
+
+# Count missing values in our variables
+colSums(is.na(case2[, c("Pages", "Packaging", "Weight",
+                       "Size", "Availability")]))
+```
+
+kiiiiiiiii
+
+```{r}
+case2 %>%
+  group_by(Year) %>%
+  summarise(n = n(),
+            pct_weight_missing = mean(is.na(Weight)))
+```
+
+```{r}
+## amazon price as float number
+case2$Amazon_Price <- as.numeric(gsub("[$,]", "", case2$Amazon_Price))
+```
+
+```{r}
+library(tidyverse)
+case2 <- case2 %>%
+  mutate(
+    Pages = as.numeric(Pages),
+    Weight= parse_number(Weight),        # remove weight label
+    Packaging = fct_lump_min(Packaging, min = 10),  # rare types > "Other"
+    Availability = factor(Availability)
+  )
+```
+
+## pages histogram (log scale)
+
+```{r}
+ggplot(case2, aes(x = Pages)) +
+  geom_histogram(bins = 40, 
+                 fill = "#378921",
+                 color = "black") +
+  scale_x_log10() +
+  labs(title = "Pages (log scale)")
+```
+
+## Weight in kg (log scale)
+
+```{r}
+ggplot(case2, aes(x = Weight)) +
+  geom_histogram(bins = 40,
+                 fill = "#378921",
+                 color = "black") +
+  scale_x_log10() +
+  labs(title = "Weight in kg (log scale)")
+```
+
+```{r}
+# most extreme sets 
+case2 %>% arrange(desc(Weight)) %>%
+  select(Set_Name, Theme, Pieces, Weight) %>% head(10)
+```
+
+```{r}
+ggplot(case2, aes(x = fct_infreq(Packaging))) +
+  geom_bar() +
+  labs(x = "Packaging")
+```
+
+```{r}
+case2 %>%
+  count(Availability) %>%
+  ggplot(aes(x = fct_reorder(Availability, n), y = n)) +
+  geom_col(fill = "#378921") +
+  coord_flip() +
+  labs(x = "Availability", y = "Number of sets") +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# Pages v. Weight - high correlation
+ggplot(case2, aes(x = Pages, y = Weight)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Pages", y = "Weight (kg)")
+  
+
+cor(case2$Pages, case2$Weight, method = "spearman", use = "complete.obs")
+```
+
+```{r}
+# Pages by Packaging
+ggplot(filter(case2, !is.na(Packaging)),
+       aes(x = Packaging, y = Pages)) +
+  geom_col() +
+  coord_flip()+
+  scale_y_log10()
+```
+
+```{r}
+ggplot(filter(case2, !is.na(Availability)),
+       aes(x = Availability, y = Weight)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  coord_flip()
+```
+
+```{r}
+pack_avail <- table(case2$Packaging, case2$Availability)
+pack_avail
+```
+
+```{r}
+case2 %>%
+  filter(!is.na(Packaging), !is.na(Availability)) %>%
+  ggplot(aes(x = Availability, fill = Packaging)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(y = "Proportion")
+chisq.test(pack_avail, simulate.p.value = TRUE)
+```
+
+```{r}
+ggplot(case2, aes(x = Pages, y = Weight, color = Packaging)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_x_log10() + scale_y_log10()
+```
+
+```{r}
+ggplot(case2, aes(x = Weight, y = Amazon_Price, color = Availability)) +
+  geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = TRUE) +
+  scale_x_log10() + scale_y_log10()
+```
+
+```{r}
+ggplot(case2, aes(x = Pages, y = Weight, color = Packaging)) +
+  geom_point(alpha = 0.6) +
+  scale_x_log10() + scale_y_log10()
+
+```
+
+```{r}
+ggplot(case2, aes(x = Size)) +
+  geom_bar()
+```
+
+```{r}
+case2 %>%
+  filter(Size == "Large") %>%
+  count(Theme)
+
+```
+
+```{r}
+case2 %>%
+  filter(!is.na(Size), !is.na(Amazon_Price)) %>%
+  ggplot(aes(x = Size, y = Amazon_Price)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(y = "Amazon price ($, log scale)")
+```
+
+```{r}
+case2 %>%
+  group_by(Size) %>%
+  summarise(n_priced = sum(!is.na(Amazon_Price)),
+            median_price = median(Amazon_Price, na.rm = TRUE))
+```
+
+```{r}
+ggplot(filter(case2, !is.na(Size)), aes(x = Size, y = Pages)) +
+  geom_boxplot() + scale_y_log10()
+```
+
+```{r}
+ggplot(filter(case2, !is.na(Size)), aes(x = Size, y = Weight)) +
+  geom_boxplot() + scale_y_log10()
+```
+
+```{r}
+table(case2$Size, case2$Packaging)
+table(case2$Size, case2$Availability)
+```
+
+```{r}
+ggplot(filter(case2, !is.na(Size)),
+       aes(x = Weight, y = Amazon_Price, color = Size)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_log10() + scale_y_log10()
+```
+
+## Summary of Findings
+
+## Pages and weight are higly correlated.
+
+## Pieces and Pages are also highly correlated, which Michael touches on.
+
+## Size reflects size of bricks, not the size of the set.
