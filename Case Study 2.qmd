@@ -40,7 +40,9 @@ str(lego[, c("Amazon_Price", "Theme", "Pieces",
 colSums(is.na(lego[, c("Amazon_Price", "Theme", "Pieces",
                        "Minifigures", "Unique_Pieces")]))
 ```
+
 #### 1.2 Cleaning LEGO Theme Names
+
 ```{r}
 # Save the original theme names in case we need them later
 lego$Theme_Original <- lego$Theme
@@ -594,49 +596,828 @@ ggplot(
   theme_minimal(base_size = 12)
 ```
 
-### 7. Summary of Exploratory Findings
+### 7. Predictive Modeling
 
-#### Theme
+#### 7.1 Examining Available Variables
 
--   LEGO themes differ considerably in their typical Amazon prices. Creator Expert has the highest median price among the themes analyzed, while DOTS and Classic are among the lowest.
+```{r}
+# Display all variables in the LEGO dataset
+names(lego)
 
--   The word cloud shows that Star Wars, Friends, City, and NINJAGO are the most prevalent themes in the dataset.
+# Check variable types and missing values
+str(lego)
 
--   The percentage-based heat map reveals that Amazon price distributions vary across themes, suggesting that Theme may be useful for predicting price.
+# Count missing observations for each variable
+sort(colSums(is.na(lego)), decreasing = TRUE)
+```
 
-#### Pieces
+```{r}
+# Number of sets with Amazon prices
+sum(!is.na(lego$Amazon_Price))
 
--   Total piece counts are strongly right-skewed, with a median of 198 pieces and a maximum of 6,020.
+# Number of sets with both Amazon and LEGO prices
+lego$Price <- as.numeric(gsub("[$, ]", "", lego$Price))
 
--   Pieces has a strong positive correlation with Amazon Price (r = 0.8117).
+sum(!is.na(lego$Amazon_Price) & !is.na(lego$Price))
 
--   The log-log scatterplot shows an approximately linear positive relationship, suggesting that logarithmic transformations may be worth exploring during modeling.
+# Examine additional predictors
+summary(lego[, c("Year", "Ages", "Pages",
+                 "Packaging", "Weight",
+                 "Availability", "Size")])
 
-#### Minifigures
+# Check how Weight is recorded
+head(na.omit(lego$Weight), 15)
+```
 
--   Recorded minifigure counts are right-skewed, with a median of 2 and a maximum of 28.
+```{r}
+# Keep LEGO sets with a known Amazon Price
+model_data <- lego[!is.na(lego$Amazon_Price), ]
 
--   Minifigures has a moderate positive correlation with Amazon Price (r = 0.5618).
+# Set a seed so our results can be reproduced
+set.seed(470)
 
--   Missing minifigure data is strongly associated with Theme. Several themes have 100% missing values, indicating that missingness may reflect differences in set characteristics or data collection.
+# Randomly select 80% of observations for training
+train_rows <- sample(
+  1:nrow(model_data),
+  size = floor(0.80 * nrow(model_data))
+)
 
-#### Unique Pieces
+# Create training and testing datasets
+train_data <- model_data[train_rows, ]
+test_data <- model_data[-train_rows, ]
 
--   Unique piece counts are right-skewed, with a median of 83 and a maximum of 1,067.
+# Check the number of observations
+cat("Training observations:", nrow(train_data), "\n")
+cat("Testing observations:", nrow(test_data), "\n")
 
--   Unique_Pieces has a strong positive correlation with Amazon Price (r = 0.7061).
+# Compare Amazon Price distributions
+summary(train_data$Amazon_Price)
+summary(test_data$Amazon_Price)
+```
 
--   Pieces and Unique_Pieces are also strongly correlated (r = 0.7794), suggesting that they may contain overlapping predictive information.
+```{r}
+# Variables used in Model 1
+numeric_vars <- c("Pieces", "Minifigures", "Unique_Pieces")
 
-#### Overall Conclusions
+# Calculate medians using training data only
+train_medians <- sapply(
+  train_data[numeric_vars],
+  median,
+  na.rm = TRUE
+)
 
--   All three numerical variables examined have positive associations with Amazon Price, with Pieces showing the strongest pairwise linear correlation.
+# Create an indicator for missing Minifigures
+train_data$Minifigures_Missing <- as.integer(
+  is.na(train_data$Minifigures)
+)
 
--   Theme also appears to be associated with price, although differences may partly reflect variation in set sizes.
+test_data$Minifigures_Missing <- as.integer(
+  is.na(test_data$Minifigures)
+)
 
--   Missing data, especially for Amazon_Price and Minifigures, will require careful consideration during predictive modeling.
+# Replace missing numerical values with training medians
+for (variable in numeric_vars) {
+  train_data[[variable]][is.na(train_data[[variable]])] <-
+    train_medians[variable]
 
--   Future modeling should evaluate whether Theme, Minifigures, and Unique_Pieces improve price predictions beyond what can be achieved using total piece count alone.
+  test_data[[variable]][is.na(test_data[[variable]])] <-
+    train_medians[variable]
+}
+
+# Replace missing themes with "Unknown"
+train_data$Theme[is.na(train_data$Theme)] <- "Unknown"
+test_data$Theme[is.na(test_data$Theme)] <- "Unknown"
+
+# Make Theme a categorical variable
+train_data$Theme <- as.factor(train_data$Theme)
+
+# Ensure test data uses the same theme categories
+test_data$Theme <- factor(
+  test_data$Theme,
+  levels = levels(train_data$Theme)
+)
+
+# Check the results
+train_medians
+
+colSums(is.na(train_data[
+  c("Theme", "Pieces", "Minifigures",
+    "Unique_Pieces", "Minifigures_Missing")
+]))
+```
+
+```{r}
+# Group themes with fewer than 10 training observations
+theme_counts <- table(train_data$Theme)
+
+common_themes <- names(theme_counts[theme_counts >= 10])
+
+# Apply the same grouping to training and testing data
+train_data$Theme_Grouped <- ifelse(
+  as.character(train_data$Theme) %in% common_themes,
+  as.character(train_data$Theme),
+  "Other"
+)
+
+test_data$Theme_Grouped <- ifelse(
+  as.character(test_data$Theme) %in% common_themes,
+  as.character(test_data$Theme),
+  "Other"
+)
+
+# Use the same theme categories in both datasets
+train_data$Theme_Grouped <- factor(train_data$Theme_Grouped)
+
+test_data$Theme_Grouped <- factor(
+  test_data$Theme_Grouped,
+  levels = levels(train_data$Theme_Grouped)
+)
+
+# Fit Model 1 using the four EDA variables
+model1 <- lm(
+  Amazon_Price ~ Theme_Grouped + Pieces +
+    Minifigures + Unique_Pieces +
+    Minifigures_Missing,
+  data = train_data
+)
+
+# Display regression results
+summary(model1)
+```
+
+```{r}
+# Predict Amazon prices for the testing data
+model1_predictions <- predict(
+  model1,
+  newdata = test_data
+)
+
+# Actual Amazon prices
+actual_prices <- test_data$Amazon_Price
+
+# Root Mean Squared Error
+model1_rmse <- sqrt(mean(
+  (actual_prices - model1_predictions)^2
+))
+
+# Mean Absolute Error
+model1_mae <- mean(
+  abs(actual_prices - model1_predictions)
+)
+
+# Test R-squared
+model1_r2 <- 1 - sum(
+  (actual_prices - model1_predictions)^2
+) / sum(
+  (actual_prices - mean(actual_prices))^2
+)
+
+# Display performance metrics
+data.frame(
+  Model = "Model 1: EDA Variables",
+  RMSE = round(model1_rmse, 2),
+  MAE = round(model1_mae, 2),
+  Test_R2 = round(model1_r2, 4)
+)
+
+# Check whether any predicted prices are negative
+sum(model1_predictions < 0)
+```
+
+```{r}
+# Convert Weight from text to kilograms
+train_data$Weight_kg <- as.numeric(
+  sub("Kg.*", "", train_data$Weight)
+)
+
+test_data$Weight_kg <- as.numeric(
+  sub("Kg.*", "", test_data$Weight)
+)
+
+# Additional numerical predictors
+extra_numeric <- c("Pages", "Weight_kg")
+
+# Create indicators for missing numerical values
+for (variable in extra_numeric) {
+
+  missing_name <- paste0(variable, "_Missing")
+
+  train_data[[missing_name]] <- as.integer(
+    is.na(train_data[[variable]])
+  )
+
+  test_data[[missing_name]] <- as.integer(
+    is.na(test_data[[variable]])
+  )
+
+  # Calculate median from training data only
+  median_value <- median(
+    train_data[[variable]],
+    na.rm = TRUE
+  )
+
+  # Replace missing values
+  train_data[[variable]][is.na(train_data[[variable]])] <-
+    median_value
+
+  test_data[[variable]][is.na(test_data[[variable]])] <-
+    median_value
+}
+
+# Additional categorical predictors
+extra_categorical <- c(
+  "Ages", "Packaging", "Availability", "Size"
+)
+
+# Group missing and uncommon categories
+for (variable in extra_categorical) {
+
+  train_values <- as.character(train_data[[variable]])
+  test_values <- as.character(test_data[[variable]])
+
+  train_values[is.na(train_values)] <- "Unknown"
+  test_values[is.na(test_values)] <- "Unknown"
+
+  # Keep categories with at least 10 training observations
+  counts <- table(train_values)
+  common <- names(counts[counts >= 10])
+
+  train_values[!train_values %in% common] <- "Other"
+  test_values[!test_values %in% common] <- "Other"
+
+  # Ensure both datasets have the same categories
+  all_levels <- union(unique(train_values), "Other")
+
+  train_data[[variable]] <- factor(
+    train_values,
+    levels = all_levels
+  )
+
+  test_data[[variable]] <- factor(
+    test_values,
+    levels = all_levels
+  )
+}
+
+# Check missing values in our additional predictors
+colSums(is.na(train_data[
+  c("Year", "Ages", "Pages", "Packaging",
+    "Weight_kg", "Availability", "Size")
+]))
+
+# Inspect the prepared variables
+summary(train_data[
+  c("Year", "Ages", "Pages", "Packaging",
+    "Weight_kg", "Availability", "Size")
+])
+```
+
+```{r}
+# Fit Model 2 with additional predictors
+model2 <- lm(
+  Amazon_Price ~ Theme_Grouped + Pieces +
+    Minifigures + Unique_Pieces +
+    Minifigures_Missing +
+    Year + Ages + Pages + Pages_Missing +
+    Packaging + Weight_kg + Weight_kg_Missing +
+    Availability + Size,
+  data = train_data
+)
+
+# Display regression results
+summary(model2)
+```
+
+```{r}
+# Compare training performance
+data.frame(
+  Model = c("Model 1: EDA Variables",
+            "Model 2: Expanded"),
+  R_Squared = round(c(
+    summary(model1)$r.squared,
+    summary(model2)$r.squared
+  ), 4),
+  Adjusted_R_Squared = round(c(
+    summary(model1)$adj.r.squared,
+    summary(model2)$adj.r.squared
+  ), 4)
+)
+```
+
+```{r}
+# Refit Model 2 without Size
+model2 <- lm(
+  Amazon_Price ~ Theme_Grouped + Pieces +
+    Minifigures + Unique_Pieces +
+    Minifigures_Missing +
+    Year + Ages + Pages + Pages_Missing +
+    Packaging + Weight_kg + Weight_kg_Missing +
+    Availability,
+  data = train_data
+)
+
+# Check the updated model
+summary(model2)
+
+# Check for remaining singular coefficients
+sum(is.na(coef(model2)))
+```
+
+```{r}
+# Predict Amazon prices for the testing data
+model2_predictions <- predict(
+  model2,
+  newdata = test_data
+)
+
+# Calculate Model 2 RMSE
+model2_rmse <- sqrt(mean(
+  (actual_prices - model2_predictions)^2
+))
+
+# Calculate Model 2 MAE
+model2_mae <- mean(
+  abs(actual_prices - model2_predictions)
+)
+
+# Calculate Model 2 test R-squared
+model2_r2 <- 1 - sum(
+  (actual_prices - model2_predictions)^2
+) / sum(
+  (actual_prices - mean(actual_prices))^2
+)
+
+# Compare Model 1 and Model 2
+model_comparison <- data.frame(
+  Model = c("Model 1: EDA Variables", "Model 2: Expanded"),
+  RMSE = round(c(model1_rmse, model2_rmse), 2),
+  MAE = round(c(model1_mae, model2_mae), 2),
+  Test_R2 = round(c(model1_r2, model2_r2), 4)
+)
+
+print(model_comparison)
+
+# Check for negative predictions
+sum(model2_predictions < 0)
+```
+
+```{r}
+# Model 3: Stepwise Linear Regression
+
+# Perform stepwise variable selection using AIC
+model3 <- step(
+  model2,
+  direction = "both",
+  trace = 0
+)
+
+# Display the selected model
+summary(model3)
+
+# Show which predictors were selected
+formula(model3)
+
+# Compare the AIC of the expanded and selected models
+data.frame(
+  Model = c("Model 2: Expanded", "Model 3: Stepwise"),
+  AIC = round(c(AIC(model2), AIC(model3)), 2)
+)
+```
+
+```{r}
+# Predict Amazon prices using Model 3
+model3_predictions <- predict(
+  model3,
+  newdata = test_data
+)
+
+# Calculate Model 3 RMSE
+model3_rmse <- sqrt(mean(
+  (actual_prices - model3_predictions)^2
+))
+
+# Calculate Model 3 MAE
+model3_mae <- mean(
+  abs(actual_prices - model3_predictions)
+)
+
+# Calculate Model 3 test R-squared
+model3_r2 <- 1 - sum(
+  (actual_prices - model3_predictions)^2
+) / sum(
+  (actual_prices - mean(actual_prices))^2
+)
+
+# Compare all three models
+model_comparison <- data.frame(
+  Model = c(
+    "Model 1: EDA Variables",
+    "Model 2: Expanded",
+    "Model 3: Stepwise"
+  ),
+  RMSE = round(c(
+    model1_rmse, model2_rmse, model3_rmse
+  ), 2),
+  MAE = round(c(
+    model1_mae, model2_mae, model3_mae
+  ), 2),
+  Test_R2 = round(c(
+    model1_r2, model2_r2, model3_r2
+  ), 4),
+  Negative_Predictions = c(
+    sum(model1_predictions < 0),
+    sum(model2_predictions < 0),
+    sum(model3_predictions < 0)
+  )
+)
+
+print(model_comparison)
+```
+
+```{r}
+# Step 17.1: Fit Model 4 - Log-Transformed Regression
+
+# Check that all Amazon prices are positive
+summary(train_data$Amazon_Price)
+sum(train_data$Amazon_Price <= 0)
+
+# Fit a linear regression predicting log(Amazon_Price)
+model4 <- lm(
+  log(Amazon_Price) ~ Theme_Grouped + Pieces +
+    Minifigures + Unique_Pieces + Minifigures_Missing,
+  data = train_data
+)
+
+# View regression results
+summary(model4)
+```
+
+```{r}
+# Step 19.1: Evaluate Model 4 - Log-Transformed Regression
+
+# Predict log-prices on the testing data
+model4_log_predictions <- predict(
+  model4,
+  newdata = test_data
+)
+
+# Convert predictions back into dollars
+model4_predictions <- exp(model4_log_predictions)
+
+# Calculate smearing correction using training residuals
+smearing_factor <- mean(exp(residuals(model4)))
+
+# Correct predictions for retransformation bias
+model4_corrected_predictions <- model4_predictions * smearing_factor
+
+# Function to calculate testing metrics
+calculate_metrics <- function(predictions, actual) {
+  c(
+    RMSE = sqrt(mean((actual - predictions)^2)),
+    MAE = mean(abs(actual - predictions)),
+    Test_R2 = 1 - sum((actual - predictions)^2) /
+      sum((actual - mean(actual))^2),
+    Negative_Predictions = sum(predictions < 0)
+  )
+}
+
+# Compare the existing models and both log-model approaches
+results <- rbind(
+  "Model 1: EDA Variables" =
+    calculate_metrics(model1_predictions, actual_prices),
+
+  "Model 2: Expanded" =
+    calculate_metrics(model2_predictions, actual_prices),
+
+  "Model 3: Stepwise" =
+    calculate_metrics(model3_predictions, actual_prices),
+
+  "Model 4: Log Regression" =
+    calculate_metrics(model4_predictions, actual_prices),
+
+  "Model 4: Log + Smearing" =
+    calculate_metrics(model4_corrected_predictions, actual_prices)
+)
+
+# Display comparison
+round(results, 4)
+```
+
+```{r}
+# Step 21.1: Investigate Model 4 Prediction Errors
+
+# Create a table comparing actual and predicted prices
+error_analysis <- data.frame(
+  Set_Name = test_data$Set_Name,
+  Actual_Price = actual_prices,
+  Model1_Prediction = model1_predictions,
+  Model4_Prediction = model4_predictions
+)
+
+# Calculate absolute prediction errors
+error_analysis$Model1_Error <- abs(
+  error_analysis$Actual_Price -
+    error_analysis$Model1_Prediction
+)
+
+error_analysis$Model4_Error <- abs(
+  error_analysis$Actual_Price -
+    error_analysis$Model4_Prediction
+)
+
+# Sort by largest Model 4 errors
+error_analysis <- error_analysis[
+  order(-error_analysis$Model4_Error),
+]
+
+# Display the 10 largest errors
+head(round(
+  error_analysis[
+    , c("Actual_Price", "Model1_Prediction",
+        "Model4_Prediction", "Model4_Error")
+  ],
+  2
+), 10)
+
+# Display names of the sets with largest errors
+head(error_analysis$Set_Name, 10)
+```
+
+```{r}
+# Step 23.1: Fit Model 5 - Polynomial Linear Regression
+
+model5 <- lm(
+  Amazon_Price ~ Theme_Grouped +
+    Pieces + I(Pieces^2) +
+    Minifigures +
+    Unique_Pieces + I(Unique_Pieces^2) +
+    Minifigures_Missing,
+  data = train_data
+)
+
+# Display regression results
+summary(model5)
+
+# Compare training performance with Model 1
+data.frame(
+  Model = c("Model 1: EDA", "Model 5: Polynomial"),
+  R_Squared = round(c(
+    summary(model1)$r.squared,
+    summary(model5)$r.squared
+  ), 4),
+  Adjusted_R_Squared = round(c(
+    summary(model1)$adj.r.squared,
+    summary(model5)$adj.r.squared
+  ), 4)
+)
+```
+
+```{r}
+# Step 25.1: Evaluate Model 5 - Polynomial Regression
+
+# Predict Amazon prices for testing data
+model5_predictions <- predict(
+  model5,
+  newdata = test_data
+)
+
+# Calculate Model 5 RMSE
+model5_rmse <- sqrt(mean(
+  (actual_prices - model5_predictions)^2
+))
+
+# Calculate Model 5 MAE
+model5_mae <- mean(
+  abs(actual_prices - model5_predictions)
+)
+
+# Calculate Model 5 test R-squared
+model5_r2 <- 1 - sum(
+  (actual_prices - model5_predictions)^2
+) / sum(
+  (actual_prices - mean(actual_prices))^2
+)
+
+# Compare Model 1 and Model 5
+data.frame(
+  Model = c(
+    "Model 1: EDA",
+    "Model 5: Polynomial"
+  ),
+  RMSE = round(c(model1_rmse, model5_rmse), 2),
+  MAE = round(c(model1_mae, model5_mae), 2),
+  Test_R2 = round(c(model1_r2, model5_r2), 4),
+  Negative_Predictions = c(
+    sum(model1_predictions < 0),
+    sum(model5_predictions < 0)
+  )
+)
+```
+
+```{r}
+# Step 27.1: Evaluate Model 1 by Price Range
+
+# Create price categories
+price_ranges <- cut(
+  actual_prices,
+  breaks = c(-Inf, 30, 100, Inf),
+  labels = c(
+    "Under $30",
+    "$30 to $100",
+    "Over $100"
+  )
+)
+
+# Create a table of actual and predicted prices
+price_range_analysis <- data.frame(
+  Price_Range = price_ranges,
+  Actual = actual_prices,
+  Predicted = model1_predictions
+)
+
+# Calculate performance for each price range
+library(dplyr)
+
+price_range_results <- price_range_analysis %>%
+  group_by(Price_Range) %>%
+  summarise(
+    Count = n(),
+    Actual_Mean = mean(Actual),
+    Predicted_Mean = mean(Predicted),
+    RMSE = sqrt(mean((Actual - Predicted)^2)),
+    MAE = mean(abs(Actual - Predicted)),
+    .groups = "drop"
+  )
+
+# Display results
+print(price_range_results)
+```
+
+```{r}
+# Step 29.1: Actual vs. Predicted Amazon Prices
+
+library(ggplot2)
+
+# Create plotting data
+prediction_plot_data <- data.frame(
+  Actual_Price = actual_prices,
+  Predicted_Price = model1_predictions
+)
+
+# Create scatterplot
+ggplot(
+  prediction_plot_data,
+  aes(x = Actual_Price, y = Predicted_Price)
+) +
+  geom_point(
+    color = "steelblue",
+    alpha = 0.65,
+    size = 2
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Actual vs. Predicted LEGO Amazon Prices",
+    subtitle = "Model 1: EDA Variables",
+    x = "Actual Amazon Price ($)",
+    y = "Predicted Amazon Price ($)",
+    caption = "Dashed red line represents perfect predictions"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# Step 31.1: Compare Model 1 with LEGO's Listed Price
+
+# Identify testing sets with an available LEGO retail price
+valid_prices <- !is.na(test_data$Price)
+
+# Actual Amazon prices for these sets
+amazon_actual <- test_data$Amazon_Price[valid_prices]
+
+# Model 1 predictions for these sets
+model_predictions <- model1_predictions[valid_prices]
+
+# LEGO's listed retail prices
+lego_prices <- test_data$Price[valid_prices]
+
+# Calculate performance for both approaches
+retail_comparison <- rbind(
+  "Model 1: Regression" =
+    calculate_metrics(model_predictions, amazon_actual),
+
+  "LEGO Listed Price" =
+    calculate_metrics(lego_prices, amazon_actual)
+)
+
+# Display results
+cat("Number of sets compared:", sum(valid_prices), "\n")
+
+round(retail_comparison, 4)
+```
+
+```{r}
+# Step 33.1: Compare Model 1 and LEGO Retail Price Errors
+
+library(ggplot2)
+
+# Create a dataset of absolute errors
+comparison_plot_data <- data.frame(
+  Method = rep(
+    c("Regression Model", "LEGO Listed Price"),
+    each = length(amazon_actual)
+  ),
+  Absolute_Error = c(
+    abs(amazon_actual - model_predictions),
+    abs(amazon_actual - lego_prices)
+  )
+)
+
+# Plot error distributions
+ggplot(
+  comparison_plot_data,
+  aes(x = Method, y = Absolute_Error, fill = Method)
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.alpha = 0.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Regression Model" = "steelblue",
+      "LEGO Listed Price" = "orange"
+    )
+  ) +
+  labs(
+    title = "Prediction Errors: Regression vs. LEGO Retail Price",
+    subtitle = "Absolute errors on 166 testing observations",
+    x = NULL,
+    y = "Absolute Prediction Error ($)",
+    caption = "Lower errors indicate more accurate Amazon price predictions"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Step 34.1: Compare RMSE and MAE - Regression vs. Retail Price
+
+library(ggplot2)
+
+# Create comparison data
+metric_data <- data.frame(
+  Metric = rep(c("RMSE", "MAE"), each = 2),
+  Method = rep(
+    c("Regression Model", "LEGO Listed Price"),
+    times = 2
+  ),
+  Error = c(26.78, 27.85, 19.30, 15.61)
+)
+
+# Create grouped bar chart
+ggplot(metric_data, aes(x = Metric, y = Error, fill = Method)) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65
+  ) +
+  geom_text(
+    aes(label = paste0("$", sprintf("%.2f", Error))),
+    position = position_dodge(width = 0.75),
+    vjust = -0.5,
+    size = 4.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Regression Model" = "#2878B5",
+      "LEGO Listed Price" = "#F2A900"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 33),
+    breaks = seq(0, 30, 5)
+  ) +
+  labs(
+    title = "Predicting LEGO Amazon Prices",
+    subtitle = "Regression Model vs. LEGO Listed Retail Price",
+    x = NULL,
+    y = "Prediction Error ($)",
+    fill = NULL,
+    caption = "Lower values indicate better accuracy | 166 testing sets"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12)
+  )
+```
 
 #### EDA of Pages, Weight, Packages, Size, Availability (Thaddeus)
 
@@ -1324,16 +2105,11 @@ ggplot(filter(lego_eda, Pieces > 0, Pages > 0), aes(x = Pieces, y = Pages)) +
 
 ### Interpretation notes
 
-- Year is a release-year category. The 2020 sample ends on September 11, so raw counts do not measure a full year of production.
-- Ages are set recommendations, not ages of purchasers. Minimum-age plots combine ranges and '+' labels; the full-label plots preserve that distinction.
-- Amazon price summaries use observed prices. Missingness comparisons help assess whether the priced subset differs from other sets.
-- Positive discounts mean Amazon is cheaper than LEGO's recommended price. The comparison uses only sets with both prices observed.
-- Price outliers are flagged for review and remain in the analysis. Raw and log scales show different aspects of the distribution.
-- Pairwise correlations use different numbers of observations. Their sample sizes are reported alongside the correlation tables.
-- Minifigures recorded as NA can mean either no minifigures or missing data; they are not automatically changed to zero.
-- These are exploratory associations. Formal modeling and a fitted-model generalizability check remain separate steps.
-
-
-
-
-
+-   Year is a release-year category. The 2020 sample ends on September 11, so raw counts do not measure a full year of production.
+-   Ages are set recommendations, not ages of purchasers. Minimum-age plots combine ranges and '+' labels; the full-label plots preserve that distinction.
+-   Amazon price summaries use observed prices. Missingness comparisons help assess whether the priced subset differs from other sets.
+-   Positive discounts mean Amazon is cheaper than LEGO's recommended price. The comparison uses only sets with both prices observed.
+-   Price outliers are flagged for review and remain in the analysis. Raw and log scales show different aspects of the distribution.
+-   Pairwise correlations use different numbers of observations. Their sample sizes are reported alongside the correlation tables.
+-   Minifigures recorded as NA can mean either no minifigures or missing data; they are not automatically changed to zero.
+-   These are exploratory associations. Formal modeling and a fitted-model generalizability check remain separate steps.
