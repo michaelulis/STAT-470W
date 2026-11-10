@@ -1,0 +1,931 @@
+---
+title: "Lateral Hand Acceleration: Exploratory Analysis"
+subtitle: "STAT 470W capstone | Original EDA and expanded response checks"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: default
+    mainfont: "Segoe UI, Arial, sans-serif"
+    monofont: "Consolas, monospace"
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+params:
+  data_dir: "data"
+  export_results: true
+  mapping_confirmed: false
+  left_response_sign: -1
+  right_response_sign: 1
+  smoothing_ms: 1
+---
+
+## Purpose and interpretation
+
+This report contains the analyses from `01_exploratory_analysis.R` and adds
+checks needed before estimating lateral response onset. Repeated versions of
+the same plot are consolidated. The original R script is unchanged; this report
+is self-contained and reads the trial CSV files directly.
+
+The project README specifies 1,000 Hz sampling, acceleration obtained by
+differentiating lateral hand position twice, and a response-search window from
+the **Pixel event to Got target or Missed target**. An extended plotting window
+provides context but does not extend the response-search window. Both hit and
+miss trials are retained when their events and signals are valid.
+
+::: {.callout-important}
+The filename-to-response mapping still needs confirmation from the data owner.
+The proposed mapping is LeftBackground = left, RightBackground = right, and
+StaticBackground = none. The proposed coordinate signs are left = -1 and
+right = +1. EDA runs without confirming these assumptions. The onset-method
+section runs only when `mapping_confirmed: true` is set after confirming both
+the labels and signs. Inspect Conditions A/B separately; their meaning is not
+inferred here.
+:::
+
+The default uses **unsmoothed, position-derived acceleration**. The smoothing
+sensitivity section compares alternative centered windows without selecting a
+preferred window from the results. Change `smoothing_ms` only with a documented
+reason: smoothing can change peak shape, threshold crossings, and onset.
+
+## Setup and reusable functions
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(knitr)
+options(dplyr.summarise.inform = FALSE)
+theme_set(theme_minimal(base_size = 11))
+knitr::opts_chunk$set(fig.width = 10, fig.height = 6, dpi = 130)
+
+data_dir <- params$data_dir
+if (!dir.exists(data_dir) && dir.exists(file.path("capstone-project", data_dir))) {
+  data_dir <- file.path("capstone-project", data_dir)
+}
+if (!dir.exists(data_dir)) stop("Data folder not found. Set params$data_dir.")
+output_dir <- file.path("eda_output")
+if (isTRUE(params$export_results)) dir.create(output_dir, showWarnings = FALSE)
+
+fs <- 1000
+baseline_limits <- c(-200, -20)
+plot_limits <- c(-200, 500)
+gmr_threshold <- 0.20
+alignment_threshold <- 0.125
+fit_half_width <- 20
+smooth_n <- as.integer(params$smoothing_ms)
+if (length(smooth_n) != 1 || is.na(smooth_n) || smooth_n < 1 || smooth_n %% 2 != 1) {
+  stop("smoothing_ms must be a positive odd integer (1 means no smoothing).")
+}
+if (any(!c(params$left_response_sign, params$right_response_sign) %in% c(-1, 1))) {
+  stop("Response signs must be -1 or +1.")
+}
+
+event_columns <- c("Command to move FF", "Got target", "Hand in start",
+  "Hand left start (good)", "Hand out start (bad)", "Missed target",
+  "Pixel event", "Show hand feedback", "Target starts moving")
+signal_columns <- c("Frame", "Right_HandX", "Right_HandY", "Right_HandVelX",
+                    "Right_HandVelY", "Right_HandAccX", "Right_HandAccY")
+
+finite_mean <- function(x) if (any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
+finite_sd <- function(x) if (sum(is.finite(x)) > 1) sd(x[is.finite(x)]) else NA_real_
+finite_max <- function(x) if (any(is.finite(x))) max(x[is.finite(x)]) else NA_real_
+finite_min <- function(x) if (any(is.finite(x))) min(x[is.finite(x)]) else NA_real_
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 3 || sd(x[ok]) == 0 || sd(y[ok]) == 0) return(NA_real_)
+  cor(x[ok], y[ok])
+}
+center_mean <- function(x, n = 1L) {
+  if (n == 1L) return(x)
+  if (length(x) < n) return(rep(NA_real_, length(x)))
+  as.numeric(stats::filter(x, rep(1 / n, n), sides = 2))
+}
+differentiate <- function(x, time_s) {
+  n <- length(x)
+  if (n < 3) return(rep(NA_real_, n))
+  span <- time_s[3:n] - time_s[1:(n - 2)]
+  result <- (x[3:n] - x[1:(n - 2)]) / span
+  result[!is.finite(span) | span <= 0] <- NA_real_
+  c(NA_real_, result, NA_real_)
+}
+event_values <- function(x) {
+  text <- trimws(as.character(x))
+  text <- text[!is.na(text) & nzchar(text)]
+  # Do not silently use the first value if an event is repeated or malformed.
+  suppressWarnings(as.numeric(text))
+}
+one_event <- function(x) {
+  z <- event_values(x)
+  if (length(z) == 1 && is.finite(z)) z else NA_real_
+}
+show_table <- function(x, digits = 2) knitr::kable(x, digits = digits)
+save_table <- function(x, name) {
+  if (isTRUE(params$export_results)) readr::write_csv(x, file.path(output_dir, name))
+}
+save_figure <- function(x, name, width = 10, height = 6) {
+  if (isTRUE(params$export_results)) {
+    ggsave(file.path(output_dir, name), x, width = width, height = height, dpi = 200)
+  }
+}
+event_lines <- function() geom_vline(xintercept = 0, linetype = "dashed", color = "gray35")
+background_colors <- c(LeftBackground = "#0072B2", RightBackground = "#D55E00",
+                       StaticBackground = "#009E73")
+```
+
+## File inventory and trial metadata
+
+This replaces original Sections 1–3, 8–9, and 13. Trial IDs use the full path,
+because trial numbers repeat across participants, conditions, and blocks.
+
+```{r}
+#| label: trial-inventory
+trial_files <- sort(list.files(data_dir, pattern = "\\.csv$", recursive = TRUE,
+                              full.names = TRUE, ignore.case = TRUE))
+if (!length(trial_files)) stop("No trial CSV files found.")
+trial_info <- tibble(File = trial_files) |>
+  mutate(
+    Trial_ID = File,
+    Participant = str_extract(File, "Participant [AB]"),
+    Block_Folder = basename(dirname(File)),
+    Condition = str_extract(Block_Folder, "(?<=Condition_)[AB]"),
+    Block = as.integer(str_extract(Block_Folder, "(?<=Block_)\\d+")),
+    Trial = as.integer(str_extract(basename(File), "(?<=Trial)\\d+")),
+    Background = str_extract(basename(File), "LeftBackground|RightBackground|StaticBackground"),
+    Target_Speed = str_extract(basename(File), "FastTarget|SlowTarget")
+  )
+if (anyNA(trial_info[c("Participant", "Condition", "Block", "Trial", "Background", "Target_Speed")])) {
+  stop("Some filenames could not be mapped to metadata; inspect trial_info.")
+}
+show_table(trial_info |> select(-Trial_ID) |> head(10))
+show_table(trial_info |> count(Participant, Condition, Block, name = "Trials"))
+show_table(trial_info |> count(Background, Target_Speed, name = "Trials"))
+show_table(trial_info |> count(Participant, Condition, Block, Trial) |> filter(n > 1))
+
+cell_counts <- trial_info |> count(Participant, Condition, Block, Background, Target_Speed) |>
+  complete(Participant, Condition, Block, Background, Target_Speed, fill = list(n = 0))
+ggplot(cell_counts, aes(factor(Block), Background, fill = n)) +
+  geom_tile(color = "white") + geom_text(aes(label = n, color = n < 18)) +
+  scale_color_manual(values = c(`TRUE` = "white", `FALSE` = "black"), guide = "none") +
+  facet_grid(Participant + Condition ~ Target_Speed) +
+  scale_fill_viridis_c() + labs(x = "Block", y = NULL, fill = "Trials",
+    title = "Trial coverage across the complete experimental design")
+save_table(trial_info, "trial_metadata.csv")
+```
+
+## Import, event validation, and position-derived signals
+
+Each file is read once for the main analysis. Checks use the full recording
+before cropping. A trial must have one numeric Pixel event, exactly one numeric
+hit or miss event, consecutive integer frames at 1 ms intervals, and complete
+position-derived acceleration throughout its response window to enter the
+expanded response analyses. Failed imports and invalid trials stay in the audit.
+
+Centered differences use actual frame times in **seconds**. They leave missing
+values at derivative boundaries rather than extrapolating. Optional centered
+smoothing is applied to position before differentiation. The full recording is
+processed before the plotting window is selected.
+
+```{r}
+#| label: import-functions
+read_trial <- function(file) {
+  raw <- read_csv(file, col_types = cols(.default = col_character()),
+                  show_col_types = FALSE, progress = FALSE)
+  missing_columns <- setdiff(c(signal_columns, event_columns), names(raw))
+  if (length(missing_columns)) stop(paste("Missing columns:", paste(missing_columns, collapse = ", ")))
+  d <- raw |> mutate(across(all_of(signal_columns), ~ suppressWarnings(as.numeric(.x))))
+  pixel <- one_event(raw$`Pixel event`)
+  hit <- event_values(raw$`Got target`)
+  miss <- event_values(raw$`Missed target`)
+  outcome <- case_when(length(hit) > 0 & length(miss) > 0 ~ "Both recorded",
+    length(hit) > 0 ~ "Hit", length(miss) > 0 ~ "Miss", TRUE ~ "No outcome recorded")
+  ending <- c(hit, miss)
+  end_frame <- if (length(ending) == 1 && is.finite(ending)) ending else NA_real_
+  frame_ok <- nrow(d) >= 5 && all(is.finite(d$Frame)) &&
+    all(d$Frame == round(d$Frame)) && all(diff(d$Frame) == 1)
+  events_ok <- is.finite(pixel) && is.finite(end_frame) && end_frame > pixel &&
+    pixel %in% d$Frame && end_frame %in% d$Frame
+  d <- d |> mutate(
+    Time_ms = Frame - pixel,
+    Time_s = Frame / fs,
+    Position_smoothed = center_mean(Right_HandX, smooth_n),
+    Velocity_from_position = differentiate(Position_smoothed, Time_s),
+    Acceleration_from_position = differentiate(Velocity_from_position, Time_s),
+    Velocity_raw_position = differentiate(Right_HandX, Time_s),
+    Acceleration_raw_position = differentiate(Velocity_raw_position, Time_s),
+    Acceleration_from_velocity = differentiate(Right_HandVelX, Time_s),
+    In_response = events_ok & Frame >= pixel & Frame <= end_frame
+  )
+  response <- d |> filter(In_response)
+  signal_ok <- nrow(response) >= 3 && all(is.finite(response$Acceleration_from_position))
+  reasons <- c(if (!frame_ok) "Invalid frame sequence",
+    if (!events_ok) "Invalid or missing event window",
+    if (events_ok && !signal_ok) "Incomplete derived response signal")
+  numeric_parse_failures <- sum(vapply(signal_columns, function(nm) {
+    text <- raw[[nm]]
+    sum(!is.na(text) & nzchar(trimws(text)) & !is.finite(d[[nm]]))
+  }, numeric(1)))
+  audit <- tibble(
+    Trial_ID = file, Import_OK = TRUE, Import_error = NA_character_,
+    Rows = nrow(d), Pixel_entries = length(event_values(raw$`Pixel event`)),
+    Hit_entries = length(hit), Miss_entries = length(miss), Outcome = outcome,
+    Pixel_frame = pixel, End_frame = end_frame, End_ms = end_frame - pixel,
+    Frame_OK = frame_ok, Events_OK = events_ok, Signal_OK = signal_ok,
+    Duplicate_frames = sum(duplicated(d$Frame)),
+    Frame_gaps = sum(diff(d$Frame) > 1, na.rm = TRUE),
+    Nonincreasing_steps = sum(diff(d$Frame) <= 0, na.rm = TRUE),
+    Numeric_parse_failures = numeric_parse_failures,
+    Missing_position = sum(!is.finite(d$Right_HandX)),
+    Missing_recorded_acceleration = sum(!is.finite(d$Right_HandAccX)),
+    Baseline_samples = sum(d$Time_ms >= baseline_limits[1] & d$Time_ms <= baseline_limits[2] &
+                            is.finite(d$Acceleration_from_position), na.rm = TRUE),
+    Plot_start_available = any(d$Time_ms == plot_limits[1], na.rm = TRUE),
+    Plot_end_available = any(d$Time_ms == plot_limits[2], na.rm = TRUE),
+    Eligible = frame_ok && events_ok && signal_ok,
+    Exclusion_reason = if (length(reasons)) paste(reasons, collapse = "; ") else "Retained"
+  )
+  keep_end <- max(500, end_frame - pixel + 300, na.rm = TRUE)
+  list(audit = audit, data = d |> filter(Time_ms >= -300, Time_ms <= keep_end),
+       events = raw |> select(Frame, all_of(event_columns)) |> head(10))
+}
+safe_read_trial <- function(file) {
+  tryCatch(read_trial(file), error = function(e) list(
+    audit = tibble(Trial_ID = file, Import_OK = FALSE, Import_error = conditionMessage(e),
+      Eligible = FALSE, Exclusion_reason = "Import failed"),
+    data = tibble(), events = tibble()))
+}
+```
+
+```{r}
+#| label: import-all-trials
+imports <- map(trial_info$File, safe_read_trial)
+trial_audit <- trial_info |> left_join(map_dfr(imports, "audit"), by = "Trial_ID")
+all_data <- map2_dfr(imports, trial_info$Trial_ID, function(x, id) {
+  if (!nrow(x$data)) return(tibble())
+  mutate(x$data, Trial_ID = id)
+})
+if (!nrow(all_data)) stop("No trial signals were imported; inspect the CSV schemas.")
+all_data <- all_data |>
+  left_join(trial_audit |> select(Trial_ID, Participant, Condition, Block, Trial,
+    Background, Target_Speed, Outcome, End_ms, Eligible), by = "Trial_ID")
+sample_index <- which(map_lgl(imports, ~ nrow(.x$data) > 0))[1]
+sample_id <- trial_info$Trial_ID[sample_index]
+sample_trial <- all_data |> filter(Trial_ID == sample_id)
+sample_metadata <- trial_audit |> filter(Trial_ID == sample_id)
+sample_label <- paste(sample_metadata$Participant, paste("Condition", sample_metadata$Condition),
+  paste("Block", sample_metadata$Block), paste("Trial", sample_metadata$Trial), sep = " | ")
+sample_events <- imports[[sample_index]]$events
+# Release the intermediate lists; all needed signals and audit fields are retained.
+rm(imports)
+response_data <- all_data |> filter(Eligible, In_response)
+if (!nrow(response_data)) stop("No valid response windows; inspect trial_audit.")
+save_table(trial_audit, "trial_quality_audit.csv")
+```
+
+### Quality, retention, and event timing
+
+```{r}
+#| label: quality-summary
+show_table(trial_audit |> count(Import_OK, Eligible, Exclusion_reason))
+show_table(trial_audit |> filter(!Import_OK) |> select(File, Import_error))
+retention <- trial_audit |>
+  group_by(Participant, Condition, Block, Background, Target_Speed) |>
+  summarise(Available = n(), Retained = sum(Eligible), Excluded = sum(!Eligible),
+    Retained_pct = 100 * Retained / Available)
+show_table(retention)
+show_table(trial_audit |> summarise(
+  Duplicate_frames = sum(Duplicate_frames, na.rm = TRUE),
+  Frame_gaps = sum(Frame_gaps, na.rm = TRUE),
+  Numeric_parse_failures = sum(Numeric_parse_failures, na.rm = TRUE),
+  Missing_position = sum(Missing_position, na.rm = TRUE),
+  Missing_recorded_acceleration = sum(Missing_recorded_acceleration, na.rm = TRUE),
+  Incomplete_baselines = sum(Baseline_samples < diff(baseline_limits) + 1, na.rm = TRUE),
+  Missing_plot_start = sum(!Plot_start_available, na.rm = TRUE),
+  Missing_plot_end = sum(!Plot_end_available, na.rm = TRUE)))
+show_table(trial_audit |> filter(Events_OK) |>
+  group_by(Participant, Condition) |>
+  summarise(N = n(), Minimum_ms = min(End_ms), Median_ms = median(End_ms),
+    Maximum_ms = max(End_ms), End_before_500 = sum(End_ms < 500)))
+ggplot(filter(trial_audit, Events_OK), aes(Background, End_ms, fill = Target_Speed)) +
+  geom_boxplot(outlier.alpha = .3) + facet_grid(Participant ~ Condition) +
+  labs(x = NULL, y = "Pixel-to-ending-event duration (ms)",
+    title = "The analysis window ends at each trial's hit or miss event") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+save_table(retention, "retained_trial_counts.csv")
+```
+
+## Original EDA: sample trial and movement signals
+
+Original Sections 4–7 and 17 inspect a sample file, its event values, and lateral
+position, velocity, and acceleration. Event numbers below are stored timestamps,
+not the row positions where the event columns happen to be populated.
+
+```{r}
+#| label: sample-inspection
+show_table(sample_metadata |> select(File, Rows, Pixel_frame, End_frame, End_ms, Outcome))
+names(sample_trial)
+show_table(sample_trial |> select(all_of(signal_columns)) |> head(6))
+summary(sample_trial$Right_HandAccX)
+show_table(sample_events)
+show_table(sample_events |> select(all_of(event_columns)) |>
+  pivot_longer(everything(), names_to = "Event", values_to = "Stored_value") |>
+  filter(!is.na(Stored_value), nzchar(Stored_value)) |> distinct())
+
+sample_plot_data <- sample_trial |> filter(between(Time_ms, -200, 500))
+p_sample <- ggplot(sample_plot_data, aes(Time_ms, Right_HandAccX)) +
+  geom_line(color = "#0072B2", linewidth = .4) + event_lines() +
+  geom_vline(xintercept = sample_metadata$End_ms, color = "#D55E00", linetype = "dotted") +
+  labs(title = "Recorded lateral acceleration: one trial", subtitle = sample_label,
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)",
+    caption = "Dashed: Pixel event. Dotted: ending event. Post-ending samples provide context only.")
+p_sample
+save_figure(p_sample, "sample_recorded_acceleration.png")
+
+sample_plot_data |> select(Time_ms, Right_HandX, Right_HandVelX, Right_HandAccX) |>
+  pivot_longer(-Time_ms, names_to = "Measurement", values_to = "Value") |>
+  ggplot(aes(Time_ms, Value)) + geom_line(color = "#0072B2", linewidth = .35) +
+  event_lines() + geom_vline(xintercept = sample_metadata$End_ms, linetype = "dotted") +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y") +
+  labs(title = "Recorded position, velocity, and acceleration", subtitle = sample_label,
+    x = "Time after Pixel event (ms)", y = "Position (m), velocity (m/s), or acceleration (m/s^2)")
+```
+
+## Original EDA: selected trial averages and variability
+
+These reproduce the comparisons in original Sections 10–16 and 21–23 using
+recorded signals, with repeated plot variants consolidated. The first selection
+is Participant A, Condition A, Block 1, static background, slow target. The last
+two plots pool all three blocks, as in the original script. These remain
+**descriptive plots over a fixed window**, including post-outcome context.
+Static trials remain useful for comparison even if they are ultimately mapped
+to the excluded “none” onset group. Shading is SD across trials, not a confidence
+interval or uncertainty across participants.
+
+```{r}
+#| label: original-averages
+legacy_data <- all_data |> filter(Eligible, Participant == "Participant A",
+  Condition == "A", Target_Speed == "SlowTarget", between(Time_ms, -200, 500))
+legacy_one_block <- legacy_data |> filter(Block == 1, Background == "StaticBackground")
+legacy_summary <- legacy_one_block |> group_by(Time_ms) |>
+  summarise(Mean = finite_mean(Right_HandAccX), SD = finite_sd(Right_HandAccX),
+    N = sum(is.finite(Right_HandAccX)))
+legacy_n <- n_distinct(legacy_one_block$Trial_ID)
+p_legacy <- ggplot(legacy_one_block, aes(Time_ms, Right_HandAccX, group = Trial_ID)) +
+  geom_line(color = "gray60", alpha = .25, linewidth = .25) +
+  geom_ribbon(data = legacy_summary, aes(x = Time_ms, ymin = Mean - SD, ymax = Mean + SD),
+    inherit.aes = FALSE, fill = "#0072B2", alpha = .15) +
+  geom_line(data = legacy_summary, aes(Time_ms, Mean), inherit.aes = FALSE,
+    color = "#0072B2", linewidth = .8) + event_lines() +
+  labs(title = "Individual and mean recorded lateral acceleration",
+    subtitle = paste("Participant A | Condition A | Block 1 | Static | Slow | n =", legacy_n),
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)",
+    caption = "Gray: individual trials. Blue: mean. Band: +/-1 SD. Fixed plotting window.")
+p_legacy
+save_figure(p_legacy, "original_individual_mean_variability.png")
+show_table(trial_info |> filter(Participant == "Participant A", Condition == "A",
+  Block == 1, Target_Speed == "SlowTarget") |> count(Background))
+
+legacy_background <- legacy_data |> filter(Block == 1) |> group_by(Background, Time_ms) |>
+  summarise(Acceleration = finite_mean(Right_HandAccX), Velocity = finite_mean(Right_HandVelX))
+legacy_background |> pivot_longer(c(Acceleration, Velocity), names_to = "Signal", values_to = "Mean") |>
+  ggplot(aes(Time_ms, Mean, color = Background)) + geom_line(linewidth = .6) +
+  event_lines() + facet_wrap(~ Signal, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = background_colors) +
+  labs(title = "Recorded acceleration and velocity by background",
+    subtitle = "Participant A | Condition A | Block 1 | Slow target",
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2) or velocity (m/s)")
+
+legacy_velocity <- legacy_data |> group_by(Background, Time_ms) |>
+  summarise(Mean = finite_mean(Right_HandVelX))
+p_velocity <- ggplot(legacy_velocity, aes(Time_ms, Mean, color = Background)) +
+  geom_line(linewidth = .7) + event_lines() + scale_color_manual(values = background_colors) +
+  labs(title = "Average lateral velocity across all three blocks",
+    subtitle = "Participant A | Condition A | Slow target",
+    x = "Time after Pixel event (ms)", y = "Recorded velocity (m/s)")
+p_velocity
+save_figure(p_velocity, "original_all_blocks_velocity.png")
+
+legacy_acceleration <- legacy_data |> filter(Background == "StaticBackground")
+legacy_all_summary <- legacy_acceleration |> group_by(Time_ms) |>
+  summarise(Mean = finite_mean(Right_HandAccX), SD = finite_sd(Right_HandAccX))
+p_all_blocks <- ggplot(legacy_acceleration, aes(Time_ms, Right_HandAccX, group = Trial_ID)) +
+  geom_line(alpha = .15, color = "gray60", linewidth = .2) +
+  geom_ribbon(data = legacy_all_summary, aes(Time_ms, ymin = Mean - SD, ymax = Mean + SD),
+    inherit.aes = FALSE, fill = "#0072B2", alpha = .15) +
+  geom_line(data = legacy_all_summary, aes(Time_ms, Mean), inherit.aes = FALSE, color = "#0072B2") +
+  event_lines() + labs(title = "Acceleration and variability across all three blocks",
+    subtitle = paste("Participant A | Condition A | Static | Slow | n =",
+      n_distinct(legacy_acceleration$Trial_ID)), x = "Time after Pixel event (ms)",
+    y = "Recorded acceleration (m/s^2)", caption = "Band: +/-1 SD across trials.")
+p_all_blocks
+save_figure(p_all_blocks, "original_all_blocks_acceleration.png")
+```
+
+## Original EDA: trial outcomes and hit rates
+
+Original Sections 18–20 are retained here. “Both recorded,” missing outcomes,
+and failed imports are shown explicitly. Hit rates use all available trials as
+the denominator, matching the original script; the valid-outcome denominator
+is also provided so incomplete event records remain visible.
+
+```{r}
+#| label: outcome-tables
+trial_outcomes <- trial_audit |> mutate(Outcome = replace_na(Outcome, "Import failed"))
+show_table(trial_outcomes |> count(Outcome) |> mutate(Percentage = 100 * n / sum(n)))
+show_table(trial_outcomes |> count(Participant, Outcome))
+hit_rate <- function(d, groups) {
+  d |> group_by(across(all_of(groups))) |>
+    summarise(Total_trials = n(), Hits = sum(Outcome == "Hit"), Misses = sum(Outcome == "Miss"),
+      Other = sum(!Outcome %in% c("Hit", "Miss"))) |>
+    mutate(Hit_rate_all = 100 * Hits / Total_trials,
+      Hit_rate_valid_outcomes = if_else(Hits + Misses > 0, 100 * Hits / (Hits + Misses), NA_real_))
+}
+show_table(hit_rate(trial_outcomes, c("Participant", "Condition")))
+show_table(hit_rate(trial_outcomes, "Target_Speed"))
+show_table(hit_rate(trial_outcomes, c("Participant", "Target_Speed")))
+outcome_by_cell <- hit_rate(trial_outcomes,
+  c("Participant", "Condition", "Block", "Background", "Target_Speed"))
+save_table(outcome_by_cell, "outcomes_by_experimental_cell.csv")
+```
+
+## Added EDA: validate position-derived acceleration
+
+The original velocity-to-acceleration check is retained, alongside the required
+position-to-velocity-to-acceleration calculation. Agreement is assessed using
+correlation **and** signed bias and RMSE; correlation alone cannot detect a scale
+or offset error. Different derivative conventions can also introduce a sample
+offset. The supplied signals are comparison measurements, not assumed ground
+truth. Numerical differentiation amplifies small position fluctuations.
+
+```{r}
+#| label: signal-validation
+sample_plot_data |> select(Time_ms, Right_HandAccX, Acceleration_from_velocity,
+  Acceleration_raw_position, Acceleration_from_position) |>
+  pivot_longer(-Time_ms, names_to = "Source", values_to = "Acceleration") |>
+  ggplot(aes(Time_ms, Acceleration, color = Source)) + geom_line(alpha = .7, linewidth = .4) +
+  event_lines() + labs(title = "Recorded and differentiated acceleration", subtitle = sample_label,
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)")
+
+agreement <- response_data |> group_by(Trial_ID) |>
+  summarise(
+    Correlation = safe_cor(Right_HandAccX, Acceleration_from_position),
+    Bias = finite_mean(Acceleration_from_position - Right_HandAccX),
+    RMSE = sqrt(finite_mean((Acceleration_from_position - Right_HandAccX)^2)),
+    Velocity_RMSE = sqrt(finite_mean((Velocity_from_position - Right_HandVelX)^2)),
+    Velocity_derivative_correlation = safe_cor(Right_HandAccX, Acceleration_from_velocity)) |>
+  left_join(trial_info |> select(Trial_ID, Participant, Condition, Background, Target_Speed), by = "Trial_ID")
+show_table(agreement |> group_by(Participant, Condition) |>
+  summarise(Trials = n(), Median_correlation = median(Correlation, na.rm = TRUE),
+    Median_bias = median(Bias, na.rm = TRUE), Median_RMSE = median(RMSE, na.rm = TRUE)))
+agreement |> pivot_longer(c(Correlation, Bias, RMSE), names_to = "Metric", values_to = "Value") |>
+  ggplot(aes(Background, Value, fill = Target_Speed)) + geom_boxplot(outlier.alpha = .2) +
+  facet_grid(Metric ~ Participant + Condition, scales = "free_y") +
+  labs(title = "Signal agreement across trials", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+save_table(agreement, "signal_agreement.csv")
+```
+
+## Added EDA: all participants, conditions, speeds, and blocks
+
+These plots use position-derived acceleration **only inside valid event
+windows**, with left/right/static kept separate. They intentionally retain the
+recorded sign so a proposed direction mapping can be checked visually.
+The mean at later times may represent fewer and different trials: interpret
+these curves alongside the contributing-trial counts, rather than treating
+late changes as changes in the same complete group of trials.
+
+```{r}
+#| label: full-design-curves
+#| fig-height: 10
+design_summary <- response_data |>
+  group_by(Participant, Condition, Background, Target_Speed, Time_ms) |>
+  summarise(Mean = finite_mean(Acceleration_from_position), SD = finite_sd(Acceleration_from_position),
+    N = sum(is.finite(Acceleration_from_position)))
+p_design <- ggplot(design_summary, aes(Time_ms, Mean, color = Background, fill = Background)) +
+  geom_ribbon(aes(ymin = Mean - SD, ymax = Mean + SD), alpha = .08, color = NA) +
+  geom_line(linewidth = .45) + facet_grid(Participant + Condition ~ Target_Speed) +
+  scale_color_manual(values = background_colors) + scale_fill_manual(values = background_colors) +
+  labs(title = "Position-derived acceleration across the experimental design",
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)",
+    caption = "Band: +/-1 SD across contributing trials. Search windows stop at each ending event.")
+p_design
+save_figure(p_design, "expanded_design_acceleration.png", height = 10)
+ggplot(design_summary, aes(Time_ms, N, color = Background)) + geom_step(linewidth = .5) +
+  facet_grid(Participant + Condition ~ Target_Speed) + scale_color_manual(values = background_colors) +
+  labs(title = "Trials contributing to each time point", x = "Time after Pixel event (ms)",
+    y = "Contributing trials")
+
+block_summary <- response_data |>
+  group_by(Participant, Condition, Block, Background, Target_Speed, Time_ms) |>
+  summarise(Mean = finite_mean(Acceleration_from_position), N = n())
+ggplot(block_summary, aes(Time_ms, Mean, color = factor(Block), linetype = Target_Speed)) +
+  geom_line(linewidth = .4) + facet_grid(Participant + Condition ~ Background) +
+  labs(title = "Check block differences before pooling", color = "Block", linetype = "Speed",
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)")
+```
+
+## Added EDA: baseline noise, polarity, and threshold feasibility
+
+The baseline is **-200 to -20 ms** relative to the Pixel event. It is a pre-event
+reference during a reaching task, not necessarily a resting period. Its mean
+and SD are descriptive; this report does not automatically subtract the mean
+or replace the project's absolute thresholds with SD thresholds.
+
+Positive and negative excursions are both reported before the direction
+mapping is confirmed. The baseline fraction outside +/-threshold is a noise
+diagnostic, **not** an onset detection rate. A large fraction suggests that a
+small fixed threshold may be sensitive to signal fluctuations.
+
+```{r}
+#| label: baseline-features
+baseline <- all_data |> filter(Eligible, between(Time_ms, baseline_limits[1], baseline_limits[2])) |>
+  group_by(Trial_ID) |>
+  summarise(Baseline_N = sum(is.finite(Acceleration_from_position)),
+    Baseline_mean = finite_mean(Acceleration_from_position),
+    Baseline_SD = finite_sd(Acceleration_from_position),
+    Baseline_RMS = sqrt(finite_mean(Acceleration_from_position^2)),
+    Fraction_outside_020 = finite_mean(abs(Acceleration_from_position) >= gmr_threshold),
+    Fraction_outside_0125 = finite_mean(abs(Acceleration_from_position) >= alignment_threshold))
+peak_features <- response_data |> group_by(Trial_ID) |>
+  summarise(
+    Positive_peak = finite_max(Acceleration_from_position),
+    Negative_peak = finite_min(Acceleration_from_position),
+    Absolute_peak = finite_max(abs(Acceleration_from_position)),
+    Absolute_peak_ms = Time_ms[which.max(abs(Acceleration_from_position))],
+    Response_RMS = sqrt(finite_mean(Acceleration_from_position^2)))
+trial_features <- trial_audit |> left_join(baseline, by = "Trial_ID") |>
+  left_join(peak_features, by = "Trial_ID") |>
+  mutate(Baseline_complete = coalesce(Baseline_N == diff(baseline_limits) + 1, FALSE),
+    Peak_near_boundary = Absolute_peak_ms <= 20 | End_ms - Absolute_peak_ms <= 20)
+show_table(trial_features |> filter(Eligible) |> group_by(Participant, Condition, Background) |>
+  summarise(Trials = n(), Complete_baselines = sum(Baseline_complete),
+    Median_baseline_mean = median(Baseline_mean, na.rm = TRUE),
+    Median_baseline_SD = median(Baseline_SD, na.rm = TRUE),
+    Median_fraction_outside_020 = median(Fraction_outside_020, na.rm = TRUE),
+    Median_fraction_outside_0125 = median(Fraction_outside_0125, na.rm = TRUE)))
+trial_features |> filter(Eligible) |>
+  ggplot(aes(Background, Baseline_SD, fill = Target_Speed)) + geom_boxplot(outlier.alpha = .25) +
+  facet_grid(Participant ~ Condition) + labs(title = "Pre-event acceleration variability",
+    x = NULL, y = "Baseline SD (m/s^2)") + theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+sample_plot_data |> select(Time_ms, Acceleration_from_position) |>
+  ggplot(aes(Time_ms, Acceleration_from_position)) + geom_line(linewidth = .35) +
+  geom_hline(yintercept = c(-gmr_threshold, gmr_threshold), color = "#D55E00", linetype = "dashed") +
+  geom_hline(yintercept = c(-alignment_threshold, alignment_threshold), color = "#0072B2", linetype = "dotted") +
+  event_lines() + geom_vline(xintercept = sample_metadata$End_ms, linetype = "dotted") +
+  labs(title = "Threshold magnitudes relative to the signal", subtitle = sample_label,
+    x = "Time after Pixel event (ms)", y = "Position-derived acceleration (m/s^2)",
+    caption = "Orange dashed: +/-0.20. Blue dotted: +/-0.125 m/s^2. Both signs are shown for diagnosis.")
+save_table(trial_features, "trial_features.csv")
+```
+
+### Smoothing sensitivity on a balanced set of example trials
+
+One reproducible trial from each participant × condition × background × speed
+cell is selected by trial ID. Centered moving averages of **position** are
+compared at 1, 11, and 21 ms before differentiation. A centered average does
+not introduce a simple one-way delay, but it can spread post-event information
+backward and alter onset. These panels illustrate sensitivity, not a validated
+filter recommendation or a reason to force threshold detection.
+
+```{r}
+#| label: smoothing-sensitivity
+#| fig-height: 11
+example_ids <- trial_audit |> filter(Eligible) |>
+  group_by(Participant, Condition, Background, Target_Speed) |> slice_min(Trial, n = 1, with_ties = FALSE) |>
+  ungroup() |> pull(Trial_ID)
+sensitivity <- all_data |> filter(Trial_ID %in% example_ids) |> group_by(Trial_ID) |>
+  group_modify(~ map_dfr(c(1L, 11L, 21L), function(width) {
+    tibble(Time_ms = .x$Time_ms,
+      Acceleration = differentiate(differentiate(center_mean(.x$Right_HandX, width), .x$Time_s), .x$Time_s),
+      Width_ms = factor(width), In_response = .x$In_response)
+  })) |> ungroup() |>
+  left_join(trial_info |> select(Trial_ID, Participant, Condition, Background, Target_Speed), by = "Trial_ID")
+ggplot(filter(sensitivity, In_response), aes(Time_ms, Acceleration, color = Width_ms)) +
+  geom_line(linewidth = .35) + facet_grid(Participant + Condition + Target_Speed ~ Background) +
+  labs(title = "Differentiated position is sensitive to smoothing", color = "Position window (ms)",
+    x = "Time after Pixel event (ms)", y = "Acceleration (m/s^2)")
+```
+
+## Added EDA: trial-level distributions, unusual trials, and outcomes
+
+Peak features here use the **largest absolute signed-signal excursion** as a
+direction-neutral screening measure. That is different from the relevant
+positive response peak needed for onset after confirming the response signs.
+A boundary peak flags a trial for inspection rather than automatically
+excluding it. Retain participant-level distinctions: repeated trials from two
+participants do not establish population-level precision.
+
+```{r}
+#| label: feature-distributions
+#| fig-height: 10
+trial_features |> filter(Eligible) |>
+  select(Participant, Condition, Background, Target_Speed, Absolute_peak, Absolute_peak_ms, End_ms) |>
+  pivot_longer(c(Absolute_peak, Absolute_peak_ms, End_ms), names_to = "Feature", values_to = "Value") |>
+  ggplot(aes(Background, Value, fill = Target_Speed)) + geom_boxplot(outlier.alpha = .2) +
+  facet_grid(Feature ~ Participant + Condition, scales = "free_y") +
+  labs(title = "Response magnitude and timing across trials", x = NULL, y = NULL,
+    caption = "Absolute_peak: m/s^2. Absolute_peak_ms and End_ms: milliseconds after Pixel event.") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+show_table(trial_features |> filter(Eligible) |> group_by(Participant, Condition, Background) |>
+  summarise(Trials = n(), Boundary_peaks = sum(Peak_near_boundary, na.rm = TRUE)))
+inspection_ids <- trial_features |> filter(Eligible) |> group_by(Participant, Condition) |>
+  group_modify(~ {
+    typical <- .x |> arrange(abs(Absolute_peak - median(Absolute_peak, na.rm = TRUE))) |> slice_head(n = 1)
+    extreme <- .x |> arrange(desc(Absolute_peak)) |> slice_head(n = 1)
+    bind_rows(mutate(typical, Example = "Typical amplitude"), mutate(extreme, Example = "Largest amplitude"))
+  }) |> ungroup() |> select(Trial_ID, Example)
+all_data |> inner_join(inspection_ids, by = "Trial_ID") |> filter(between(Time_ms, -200, 500)) |>
+  mutate(Inspection_label = str_wrap(paste(Participant, paste("Condition", Condition),
+    paste("Block", Block), paste("Trial", Trial), Background, Target_Speed, Example, sep = " | "), width = 65)) |>
+  ggplot(aes(Time_ms, Acceleration_from_position)) + geom_line(linewidth = .3) + event_lines() +
+  geom_vline(aes(xintercept = End_ms), linetype = "dotted", color = "#D55E00") +
+  facet_wrap(~ Inspection_label, scales = "free_y", ncol = 2) +
+  theme(strip.text = element_text(size = 8)) +
+  labs(title = "Inspect typical and extreme trials", x = "Time after Pixel event (ms)",
+    y = "Position-derived acceleration (m/s^2)")
+```
+
+```{r}
+#| label: outcome-comparisons
+#| fig-height: 9
+outcome_curves <- response_data |> filter(Outcome %in% c("Hit", "Miss")) |>
+  group_by(Participant, Condition, Background, Target_Speed, Outcome, Time_ms) |>
+  summarise(Mean = finite_mean(Acceleration_from_position), N = n())
+ggplot(outcome_curves, aes(Time_ms, Mean, color = Outcome, linetype = Target_Speed)) +
+  geom_line(linewidth = .45) + facet_grid(Participant + Condition ~ Background) +
+  labs(title = "Hit and miss response traces", x = "Time after Pixel event (ms)",
+    y = "Position-derived acceleration (m/s^2)",
+    caption = "Cell sizes differ; late averages use only trials whose outcome has not yet occurred.")
+show_table(trial_features |> filter(Eligible, Outcome %in% c("Hit", "Miss")) |>
+  group_by(Participant, Condition, Target_Speed, Outcome) |>
+  summarise(N = n(), Median_peak = median(Absolute_peak),
+    Median_peak_ms = median(Absolute_peak_ms), Median_duration_ms = median(End_ms)))
+```
+
+## Optional onset analysis: ordinary and threshold-aligned GMR
+
+This section implements the procedures in the project README rather than
+treating threshold crossing itself as onset. It is disabled until the proposed
+mapping and coordinate signs are confirmed. Edit the table below if needed.
+“None” trials stay in EDA but do not enter either onset method.
+
+Participant × condition × direction × speed groups are kept separate before
+any participant summary, with blocks pooled only at this stage. The participant
+summary uses equal weights across available groups for ordinary GMR and equal
+weights across valid trial onsets for threshold-aligned GMR; it reports coverage
+so these two aggregation choices are explicit. Confirm the intended condition
+and speed pooling for the final project analysis.
+
+For each peak search, only the trial's event window is used. The **last upward
+crossing before the relevant positive peak** is found, with linear interpolation
+between adjacent samples. Because the README does not specify an additional
+physiological peak-selection rule, the largest positive peak is the candidate;
+its validity still needs visual review. Absolute values are not used to turn
+negative noise into a positive response.
+
+Ordinary GMR fits +/-20 ms around the mean-trace 0.20 m/s^2 crossing. Threshold-
+aligned GMR uses each trial's 0.125 m/s^2 crossing, averages on a shared 1 ms
+grid, and fits -20 to +20 ms about the shared alignment point. No interpolation
+or regression window is allowed outside the valid event window. Incomplete
+windows, absent crossings, nonpositive slopes, implausible extrapolations, or
+incomplete trial contribution to the fit are flagged rather than forced.
+This stricter complete-window rule is reported as a coverage limitation.
+
+```{r}
+#| label: onset-functions
+direction_map <- tribble(
+  ~Background, ~Direction, ~Response_sign,
+  "LeftBackground", "Left", as.numeric(params$left_response_sign),
+  "RightBackground", "Right", as.numeric(params$right_response_sign),
+  "StaticBackground", "None", NA_real_
+)
+show_table(direction_map)
+group_columns <- c("Participant", "Condition", "Direction", "Target_Speed")
+
+last_crossing <- function(time, acceleration, threshold) {
+  ok <- is.finite(time) & is.finite(acceleration)
+  t <- time[ok]; a <- acceleration[ok]
+  if (length(a) < 3 || max(a) <= threshold) {
+    return(list(Status = "No positive peak above threshold", Crossing = NA_real_, Peak_ms = NA_real_))
+  }
+  peak <- which.max(a)
+  if (peak <= 1) return(list(Status = "Peak at window start", Crossing = NA_real_, Peak_ms = t[peak]))
+  candidates <- which(head(a, -1) < threshold & tail(a, -1) >= threshold &
+                        seq_len(length(a) - 1) < peak & diff(t) <= 1.001)
+  if (!length(candidates)) return(list(Status = "No valid upward crossing before peak",
+                                      Crossing = NA_real_, Peak_ms = t[peak]))
+  j <- tail(candidates, 1)
+  crossing <- t[j] + (threshold - a[j]) * (t[j + 1] - t[j]) / (a[j + 1] - a[j])
+  list(Status = "OK", Crossing = crossing, Peak_ms = t[peak])
+}
+fit_onset_line <- function(time, acceleration, center) {
+  grid <- center + seq(-fit_half_width, fit_half_width, by = 1)
+  if (length(time) < 3 || min(grid) < min(time) || max(grid) > max(time)) {
+    return(list(Status = "Incomplete 41 ms regression window"))
+  }
+  y <- approx(time, acceleration, xout = grid, rule = 1)$y
+  if (any(!is.finite(y))) return(list(Status = "Missing regression samples"))
+  fit <- lm(y ~ grid)
+  intercept <- unname(coef(fit)[1]); slope <- unname(coef(fit)[2])
+  onset <- -intercept / slope
+  if (!is.finite(slope) || slope <= 0 || !is.finite(onset) || onset > center) {
+    return(list(Status = "Invalid rising-line extrapolation"))
+  }
+  list(Status = "OK", Slope = slope, Intercept = intercept, Onset = onset,
+       R_squared = summary(fit)$r.squared)
+}
+run_gmr <- function(d) {
+  curve <- d |> group_by(Time_ms) |> summarise(Mean = mean(Response), N = n_distinct(Trial_ID))
+  crossing <- last_crossing(curve$Time_ms, curve$Mean, gmr_threshold)
+  result <- tibble(Method = "Ordinary GMR", Status = crossing$Status,
+    Trials = n_distinct(d$Trial_ID), Valid_trials = 0L, Crossing_ms = crossing$Crossing,
+    Peak_ms = crossing$Peak_ms, Onset_ms = NA_real_, Slope = NA_real_,
+    Intercept = NA_real_, R_squared = NA_real_)
+  if (crossing$Status != "OK") return(list(result = result, curve = curve))
+  fit <- fit_onset_line(curve$Time_ms, curve$Mean, crossing$Crossing)
+  result$Status <- fit$Status
+  required <- curve |> filter(abs(Time_ms - crossing$Crossing) <= fit_half_width + 1)
+  if (fit$Status == "OK" && any(required$N != result$Trials)) {
+    result$Status <- "Changing trial contribution in regression window"
+  }
+  if (result$Status == "OK" && fit$Onset < 0) result$Status <- "Estimated onset before Pixel event"
+  if (result$Status == "OK") {
+    result$Onset_ms <- fit$Onset; result$Slope <- fit$Slope; result$Intercept <- fit$Intercept
+    result$R_squared <- fit$R_squared; result$Valid_trials <- result$Trials
+  }
+  list(result = result, curve = curve)
+}
+run_threshold_gmr <- function(d) {
+  trials <- d |> group_by(Trial_ID) |> group_split()
+  crossings <- map_dfr(trials, function(trial) {
+    crossing <- last_crossing(trial$Time_ms, trial$Response, alignment_threshold)
+    status <- crossing$Status
+    if (status == "OK" && (crossing$Crossing - fit_half_width < min(trial$Time_ms) ||
+        crossing$Crossing + fit_half_width > max(trial$Time_ms))) {
+      status <- "Incomplete 41 ms alignment window"
+    }
+    tibble(Trial_ID = trial$Trial_ID[1], Crossing_ms = crossing$Crossing,
+      Peak_ms = crossing$Peak_ms, Status = status)
+  })
+  crossings <- crossings |> mutate(Shared_delay_ms = NA_real_, Onset_ms = NA_real_)
+  valid <- crossings |> filter(Status == "OK")
+  result <- tibble(Method = "Threshold-aligned GMR", Status = "No valid alignment trials",
+    Trials = length(trials), Valid_trials = 0L, Alignment_trials = nrow(valid), Crossing_ms = NA_real_,
+    Peak_ms = NA_real_, Onset_ms = NA_real_, Slope = NA_real_, Intercept = NA_real_,
+    R_squared = NA_real_, Shared_delay_ms = NA_real_)
+  if (!nrow(valid)) return(list(result = result, curve = tibble(), trials = crossings))
+  # Shift by the saved crossing, not by a rounded approximation to it.
+  aligned <- map_dfr(trials, function(trial) {
+    cross <- valid$Crossing_ms[match(trial$Trial_ID[1], valid$Trial_ID)]
+    if (!length(cross) || !is.finite(cross)) return(tibble())
+    grid <- seq(ceiling(min(trial$Time_ms) - cross), floor(max(trial$Time_ms) - cross), by = 1)
+    tibble(Trial_ID = trial$Trial_ID[1], Time_ms = grid,
+      Response = approx(trial$Time_ms - cross, trial$Response, xout = grid, rule = 1)$y)
+  })
+  curve <- aligned |> group_by(Time_ms) |>
+    summarise(Mean = finite_mean(Response), N = sum(is.finite(Response)))
+  fit <- fit_onset_line(curve$Time_ms, curve$Mean, 0)
+  result$Status <- fit$Status
+  if (fit$Status == "OK" && any(curve$N[abs(curve$Time_ms) <= fit_half_width] != nrow(valid))) {
+    result$Status <- "Incomplete aligned regression contribution"
+  }
+  if (result$Status == "OK") {
+    delay <- -fit$Onset
+    crossings <- crossings |> mutate(Shared_delay_ms = delay,
+      Onset_ms = if_else(Status == "OK", Crossing_ms - delay, NA_real_),
+      Status = if_else(Status == "OK" & Onset_ms < 0, "Estimated onset before Pixel event", Status),
+      Onset_ms = if_else(Status == "OK", Onset_ms, NA_real_))
+    result$Onset_ms <- finite_mean(crossings$Onset_ms)
+    result$Valid_trials <- sum(is.finite(crossings$Onset_ms))
+    result$Crossing_ms <- finite_mean(crossings$Crossing_ms[is.finite(crossings$Onset_ms)])
+    result$Slope <- fit$Slope; result$Intercept <- fit$Intercept
+    result$R_squared <- fit$R_squared; result$Shared_delay_ms <- delay
+    if (!result$Valid_trials) result$Status <- "No valid post-Pixel trial onsets"
+  } else {
+    crossings <- crossings |> mutate(Status = if_else(Status == "OK", result$Status, Status))
+  }
+  list(result = result, curve = curve, trials = crossings)
+}
+```
+
+```{r}
+#| label: onset-execution
+#| results: asis
+#| fig-height: 10
+if (!isTRUE(params$mapping_confirmed)) {
+  cat("**Onset estimation was not run:** confirm the direction mapping and coordinate signs, then set `mapping_confirmed: true`. All EDA above runs independently.\n")
+} else {
+  onset_data <- response_data |> left_join(direction_map, by = "Background") |>
+    filter(Direction != "None", is.finite(Response_sign)) |>
+    mutate(Response = Acceleration_from_position * Response_sign)
+  grouped <- onset_data |> group_by(across(all_of(group_columns))) |> group_nest()
+  if (!nrow(grouped)) stop("No eligible directional onset groups.")
+  grouped <- grouped |> mutate(Ordinary = map(data, run_gmr), Aligned = map(data, run_threshold_gmr))
+  method_results <- map_dfr(seq_len(nrow(grouped)), function(i) {
+    bind_cols(grouped[rep(i, 2), group_columns],
+      bind_rows(grouped$Ordinary[[i]]$result, grouped$Aligned[[i]]$result))
+  })
+  trial_onsets <- map_dfr(seq_len(nrow(grouped)), function(i) {
+    bind_cols(grouped[rep(i, nrow(grouped$Aligned[[i]]$trials)), group_columns], grouped$Aligned[[i]]$trials)
+  })
+  print(show_table(method_results))
+  cat("\n\nTrial-level threshold-alignment status:\n\n")
+  print(show_table(trial_onsets |> count(Participant, Condition, Direction, Target_Speed, Status)))
+  diagnostic_curves <- map_dfr(seq_len(nrow(grouped)), function(i) {
+    map2_dfr(c("Ordinary", "Aligned"), c("Ordinary GMR", "Threshold-aligned GMR"), function(slot, method) {
+      curve <- grouped[[slot]][[i]]$curve
+      if (!nrow(curve)) return(tibble())
+      bind_cols(grouped[rep(i, nrow(curve)), group_columns], curve) |> mutate(Method = method)
+    })
+  })
+  diagnostic_lines <- method_results |> filter(Status == "OK") |>
+    mutate(Plot_crossing = if_else(Method == "Ordinary GMR", Crossing_ms, 0),
+      Plot_onset = if_else(Method == "Ordinary GMR", Onset_ms, -Shared_delay_ms),
+      Threshold = if_else(Method == "Ordinary GMR", gmr_threshold, alignment_threshold))
+  for (method in c("Ordinary GMR", "Threshold-aligned GMR")) {
+    curves <- diagnostic_curves |> filter(Method == method)
+    lines <- diagnostic_lines |> filter(Method == method)
+    if (!nrow(curves)) next
+    p <- ggplot(curves, aes(Time_ms, Mean)) + geom_line(linewidth = .45) +
+      geom_hline(yintercept = 0, color = "gray70") +
+      geom_hline(yintercept = if (method == "Ordinary GMR") gmr_threshold else alignment_threshold,
+        color = "#D55E00", linetype = "dotted") +
+      geom_segment(data = lines, aes(x = Plot_onset, y = 0,
+        xend = Plot_crossing + fit_half_width,
+        yend = Intercept + Slope * (Plot_crossing + fit_half_width)),
+        inherit.aes = FALSE, color = "#0072B2") +
+      geom_vline(data = lines, aes(xintercept = Plot_crossing), linetype = "dashed", color = "#D55E00") +
+      geom_vline(data = lines, aes(xintercept = Plot_onset), linetype = "dashed", color = "#009E73") +
+      facet_grid(Participant + Condition ~ Direction + Target_Speed) +
+      labs(title = paste(method, "diagnostics"),
+        x = if (method == "Ordinary GMR") "Time after Pixel event (ms)" else "Time after threshold alignment (ms)",
+        y = "Direction-consistent acceleration (m/s^2)",
+        caption = "Orange: threshold/crossing. Blue: fitted line. Green: estimated zero intercept. See status table for flagged groups.")
+    print(p)
+    save_figure(p, paste0(if (method == "Ordinary GMR") "gmr" else "threshold_aligned_gmr", "_diagnostics.png"), height = 10)
+  }
+  participant_summary <- method_results |> group_by(Participant, Method) |>
+    summarise(Groups_available = n(), Groups_valid = sum(Status == "OK"),
+      Trials_valid = sum(Valid_trials),
+      Mean_onset_ms = if (first(Method) == "Ordinary GMR") finite_mean(Onset_ms) else {
+        ok <- is.finite(Onset_ms) & Valid_trials > 0
+        if (any(ok)) weighted.mean(Onset_ms[ok], Valid_trials[ok]) else NA_real_
+      })
+  cat("\n\nParticipant summaries (descriptive; inspect coverage and group differences):\n\n")
+  print(show_table(participant_summary))
+  save_table(method_results, "onset_group_results.csv")
+  save_table(trial_onsets, "threshold_aligned_trial_onsets.csv")
+  save_table(participant_summary, "participant_onset_summary.csv")
+}
+```
+
+## What to review before reporting final onset results
+
+1. Confirm left/right/none labels, acceleration signs, and the meaning of Conditions A/B.
+2. Inspect event-duration distributions, signal agreement, baseline variability,
+   and candidate peak shapes. Check whether a short response window actually
+   contains the intended correction response.
+3. Document any filtering decision and examine onset sensitivity rather than
+   choosing smoothing to obtain a preferred answer.
+4. Review block, condition, and speed differences before accepting a pooled
+   participant summary. Report exclusions and valid-group coverage with onset.
+5. Keep trial variability distinct from uncertainty across people. This dataset
+   contains two participants; no population-level inferential claims are made here.
+
+## Original-script coverage
+
+| Original sections | Location in this report |
+|---|---|
+| 1–3: packages, paths, file discovery | Setup; file inventory |
+| 4–7: sample, events, acceleration, position/velocity | Sample trial and movement signals |
+| 8–9, 13: organization, metadata, background counts | File inventory; selected trial averages |
+| 10–12: alignment, individual/mean traces, SD | Selected trial averages and variability |
+| 14–16: background acceleration/velocity, derivative check | Selected averages; validate position-derived acceleration |
+| 17–20: events, outcomes, participant/condition/speed hit rates | Sample events; trial outcomes and hit rates |
+| 21–23: all-block velocity and acceleration, SD | Selected trial averages and variability |
+
+## Reproducibility
+
+Render this file from the project folder using Quarto's **Render** button or
+`quarto render 02_exploratory_analysis.qmd`. Required R packages are `tidyverse`,
+`knitr`, and `rmarkdown`. The HTML includes expandable code. With
+`export_results: true`, audit tables, feature tables, and selected figures are
+saved in `eda_output/`; the original `figures/` outputs are preserved.
+
+The method constants above come from the supplied `working_projectREADME.pdf`:
+0.20 m/s^2 ordinary GMR, 0.125 m/s^2 threshold alignment, and a +/-20 ms linear-fit
+window. The README remains the project specification; the optional mapping,
+filtering, grouping, and complete-window rules are explicitly identified here
+as analysis choices requiring review.
+
+```{r}
+#| label: session-information
+sessionInfo()
+```
