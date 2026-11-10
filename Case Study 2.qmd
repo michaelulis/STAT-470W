@@ -40,7 +40,9 @@ str(lego[, c("Amazon_Price", "Theme", "Pieces",
 colSums(is.na(lego[, c("Amazon_Price", "Theme", "Pieces",
                        "Minifigures", "Unique_Pieces")]))
 ```
+
 #### 1.2 Cleaning LEGO Theme Names
+
 ```{r}
 # Save the original theme names in case we need them later
 lego$Theme_Original <- lego$Theme
@@ -1324,16 +1326,627 @@ ggplot(filter(lego_eda, Pieces > 0, Pages > 0), aes(x = Pieces, y = Pages)) +
 
 ### Interpretation notes
 
-- Year is a release-year category. The 2020 sample ends on September 11, so raw counts do not measure a full year of production.
-- Ages are set recommendations, not ages of purchasers. Minimum-age plots combine ranges and '+' labels; the full-label plots preserve that distinction.
-- Amazon price summaries use observed prices. Missingness comparisons help assess whether the priced subset differs from other sets.
-- Positive discounts mean Amazon is cheaper than LEGO's recommended price. The comparison uses only sets with both prices observed.
-- Price outliers are flagged for review and remain in the analysis. Raw and log scales show different aspects of the distribution.
-- Pairwise correlations use different numbers of observations. Their sample sizes are reported alongside the correlation tables.
-- Minifigures recorded as NA can mean either no minifigures or missing data; they are not automatically changed to zero.
-- These are exploratory associations. Formal modeling and a fitted-model generalizability check remain separate steps.
+-   Year is a release-year category. The 2020 sample ends on September 11, so raw counts do not measure a full year of production.
+-   Ages are set recommendations, not ages of purchasers. Minimum-age plots combine ranges and '+' labels; the full-label plots preserve that distinction.
+-   Amazon price summaries use observed prices. Missingness comparisons help assess whether the priced subset differs from other sets.
+-   Positive discounts mean Amazon is cheaper than LEGO's recommended price. The comparison uses only sets with both prices observed.
+-   Price outliers are flagged for review and remain in the analysis. Raw and log scales show different aspects of the distribution.
+-   Pairwise correlations use different numbers of observations. Their sample sizes are reported alongside the correlation tables.
+-   Minifigures recorded as NA can mean either no minifigures or missing data; they are not automatically changed to zero.
+-   These are exploratory associations. Formal modeling and a fitted-model generalizability check remain separate steps.
 
+# Additional Modeling for Amazon Price
 
+These sections run independently of the earlier EDA. They read a fresh copy of
+`case-study2-data.csv` from the project folder and leave the EDA objects unchanged.
+Run the chunks in order. Install the packages listed in the first chunk if needed.
+Results and figures are written to the relative `modeling-results` folder.
 
+The presentation compares regressions and LASSO, but their fitting code and exact
+split are not in the supplied QMD. This workflow establishes a new reproducible
+comparison. It does not reproduce the slides' reported RMSE or provide independent
+confirmation using a new dataset. Sets in this split may have appeared in the
+earlier analyses.
 
+We select a model by **RMSE in dollars** from repeated cross-validation in the
+development sample. MAE shows performance when large errors receive less extra
+weight. We keep the calibration and test samples out of model selection. The
+LEGO recommended price, item numbers, set names, and anything derived from price
+are excluded from all predictors. Amazon price is used only as the response.
+
+## 1. Setup and an independent modeling dataset
+
+The response must be observed and positive to train or evaluate a price model.
+We retain all such sets even when predictors are missing. Age labels become their
+minimum recommendations, and weight is expressed in kilograms. We retain unknown
+minifigure counts as missing because an NA can represent either zero or unavailable
+information. No expensive set is removed simply because its price is unusual.
+
+```{r amz-model-1}
+amz_packages <- c("readr", "dplyr", "ggplot2", "randomForest")
+amz_missing_packages <- amz_packages[!vapply(amz_packages, requireNamespace,
+                                          logical(1), quietly = TRUE)]
+if (length(amz_missing_packages)) {
+  stop("Install the missing packages first: install.packages(c(",
+       paste(sprintf('"%s"', amz_missing_packages), collapse = ", "), "))")
+}
+library(dplyr)
+library(ggplot2)
+amz_show_plot <- function(p) {
+  if(interactive() || isTRUE(getOption("knitr.in.progress"))) print(p)
+}
+amz_data_file <- "case-study2-data.csv"
+amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(amz_data_file)) {
+  stop("Place case-study2-data.csv beside this script/QMD and run from that folder.")
+}
+amz_seed <- 4702026
+amz_folds <- 5L
+amz_repeats <- 2L
+amz_interval_level <- 0.90
+amz_raw <- readr::read_csv(amz_data_file,
+  locale = readr::locale(encoding = "Latin1"),
+  na = c("", "NA", "N/A"), show_col_types = FALSE)
+
+amz_number <- function(x) {
+  suppressWarnings(readr::parse_number(as.character(x), na = c("", "NA", "N/A")))
+}
+amz_clean <- function(raw) {
+  required <- c("Item_Number", "Set_Name", "Amazon_Price", "Theme", "Pieces",
+    "Unique_Pieces", "Minifigures", "Year", "Ages", "Pages", "Weight",
+    "Size", "Packaging", "Availability")
+  stopifnot(all(required %in% names(raw)))
+  age <- trimws(sub("^Ages_", "", as.character(raw$Ages)))
+  age <- gsub("[[:space:]]", "", age)
+  age <- gsub("\u00bd", ".5", age, fixed = TRUE)
+  age[is.na(age) | age %in% c("", "NA", "N/A")] <- NA_character_
+  valid_age <- is.na(age) | grepl("^[0-9]+(\\.[0-9]+)?(\\+|-[0-9]+(\\.[0-9]+)?)$", age)
+  if (!all(valid_age)) stop("Unrecognized Ages labels: ", paste(unique(age[!valid_age]), collapse=", "))
+  weight_text <- as.character(raw$Weight)
+  weight <- amz_number(weight_text)
+  pounds_only <- !is.na(weight_text) & grepl("lb", weight_text, ignore.case=TRUE) &
+    !grepl("kg", weight_text, ignore.case=TRUE)
+  weight[pounds_only] <- weight[pounds_only] / 2.2046226218
+  out <- data.frame(
+    Item_Number = as.character(raw$Item_Number), Set_Name = as.character(raw$Set_Name),
+    Amazon_Price = amz_number(raw$Amazon_Price),
+    Pieces = amz_number(raw$Pieces), Unique_Pieces = amz_number(raw$Unique_Pieces),
+    Minifigures = amz_number(raw$Minifigures), Pages = amz_number(raw$Pages),
+    Weight = weight, Age_Min = suppressWarnings(as.numeric(sub("[+-].*$", "", age))),
+    Theme = as.character(raw$Theme), Year = as.character(raw$Year),
+    Size = as.character(raw$Size), Packaging = as.character(raw$Packaging),
+    Availability = as.character(raw$Availability), stringsAsFactors=FALSE)
+  for (v in c("Theme", "Year", "Size", "Packaging", "Availability")) {
+    out[[v]] <- trimws(out[[v]])
+    out[[v]][out[[v]] %in% c("", "NA", "N/A")] <- NA_character_
+  }
+  for (v in c("Pieces", "Unique_Pieces", "Minifigures", "Pages", "Weight", "Age_Min")) {
+    out[[v]][!is.finite(out[[v]]) | out[[v]] < 0] <- NA_real_
+  }
+  out
+}
+amz_all <- amz_clean(amz_raw)
+if (anyDuplicated(amz_all$Item_Number)) stop("Duplicate set IDs need review before splitting.")
+if (any(amz_all$Amazon_Price <= 0, na.rm=TRUE)) stop("Review nonpositive Amazon prices before modeling.")
+amz_observed <- amz_all[is.finite(amz_all$Amazon_Price) & amz_all$Amazon_Price > 0, ]
+amz_unpriced <- amz_all[!is.finite(amz_all$Amazon_Price), ]
+print(data.frame(All_Sets=nrow(amz_all), Observed_Amazon=nrow(amz_observed),
+                 Missing_Amazon=nrow(amz_unpriced)))
+amz_predictor_missingness <- data.frame(
+  Predictor=c("Pieces","Unique_Pieces","Minifigures","Pages","Weight","Age_Min",
+              "Theme","Year","Size","Packaging","Availability"))
+amz_predictor_missingness$Missing_Among_Priced <- vapply(
+  amz_observed[amz_predictor_missingness$Predictor],function(x) sum(is.na(x)),integer(1))
+print(amz_predictor_missingness)
+# Price, names, and IDs never enter a design matrix. Price is read separately
+# only after model selection for the LEGO-price generalizability check.
+```
+
+## 2. Development, calibration, and test samples
+
+The 826 priced sets are split into an 80% training pool (660 sets) and a final
+test sample (166). The training pool is further divided into 528 development sets
+and 132 calibration sets. Development data support repeated 5-fold CV. Calibration
+data determine prediction interval width after the model is selected. The test
+data provide the final error and interval coverage estimates. Stratification by
+release year and price group helps distribute the observations across samples.
+
+```{r amz-model-2}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# This NEW split is not a reproduction of the presentation's unavailable split.
+# Its rows may overlap sets used earlier, so it is not an independent new dataset.
+# The 80% training pool contains a development sample and an interval-calibration
+# sample. Calibration outcomes do not choose the model or fit its coefficients.
+amz_strata <- function(dat) {
+  rank_bin <- pmin(5L, ceiling(5 * rank(dat$Amazon_Price, ties.method="first") / nrow(dat)))
+  interaction(dat$Year, rank_bin, drop=TRUE)
+}
+amz_sample_fraction <- function(dat, fraction, seed) {
+  set.seed(seed)
+  groups <- split(seq_len(nrow(dat)), amz_strata(dat))
+  take <- unlist(lapply(groups, function(i) i[sample.int(length(i), floor(length(i)*fraction))]))
+  wanted <- floor(nrow(dat)*fraction)
+  if (length(take)<wanted) {
+    remaining <- setdiff(seq_len(nrow(dat)),take)
+    take <- c(take,remaining[sample.int(length(remaining),wanted-length(take))])
+  }
+  sort(take)
+}
+amz_pool_i <- amz_sample_fraction(amz_observed, 0.80, amz_seed)
+amz_pool <- amz_observed[amz_pool_i, ]
+amz_test <- amz_observed[-amz_pool_i, ]
+amz_dev_i <- amz_sample_fraction(amz_pool, 0.80, amz_seed+1L)
+amz_development <- amz_pool[amz_dev_i, ]
+amz_calibration <- amz_pool[-amz_dev_i, ]
+amz_split_table <- data.frame(
+  Sample=c("Development and cross-validation", "Interval calibration", "Final test"),
+  Sets=c(nrow(amz_development), nrow(amz_calibration), nrow(amz_test)))
+print(amz_split_table)
+amz_membership <- bind_rows(
+  mutate(amz_development[c("Item_Number", "Set_Name")], Sample="Development"),
+  mutate(amz_calibration[c("Item_Number", "Set_Name")], Sample="Calibration"),
+  mutate(amz_test[c("Item_Number", "Set_Name")], Sample="Test"))
+write.csv(amz_membership, file.path(amz_output_dir,"sample-membership.csv"), row.names=FALSE)
+```
+
+## 3. Preprocessing learned only from the current training sample
+
+Every CV fit learns its own medians, rare-category groups, spline knots, and
+design columns using only that fold's training rows. This avoids borrowing
+information from the assessment fold. Missing numeric values receive training
+medians plus missingness indicators. Categories with fewer than 10 training sets
+are grouped, except release year and brick size. Unseen levels map to Other, and
+the final prediction export flags unseen categories for review.
+
+```{r amz-model-3}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+amz_num <- c("Pieces", "Unique_Pieces", "Minifigures", "Pages", "Weight", "Age_Min")
+amz_cat <- c("Theme", "Year", "Size", "Packaging", "Availability")
+amz_learn_prep <- function(train) {
+  medians <- vapply(train[amz_num], function(x) {
+    if (all(is.na(x))) return(0)
+    median(x, na.rm=TRUE)
+  }, numeric(1))
+  maps <- lapply(amz_cat, function(v) {
+    x <- train[[v]]; x[is.na(x)] <- "Missing"
+    counts <- sort(table(x), decreasing=TRUE)
+    keep <- if(v %in% c("Year", "Size")) names(counts) else names(counts)[counts>=10]
+    keep <- union(keep, intersect("Missing", names(counts)))
+    mapped <- ifelse(x %in% keep, x, "Other")
+    ref <- names(sort(table(mapped), decreasing=TRUE))[1]
+    list(keep=keep, levels=c(ref, sort(setdiff(union(mapped,"Other"),ref))), seen=unique(x))
+  }); names(maps) <- amz_cat
+  filled_pieces <- train$Pieces; filled_pieces[is.na(filled_pieces)] <- medians["Pieces"]
+  list(medians=medians, categories=maps,
+       piece_spline=splines::ns(log1p(filled_pieces), df=3),
+       ranges=lapply(train[amz_num], function(x) range(x,na.rm=TRUE)))
+}
+amz_design <- function(dat, prep, style) {
+  # Observed zeros remain zeros. Unknown Minifigures get a training median and
+  # a separate missingness indicator, rather than being assumed to mean zero.
+  nums <- dat[amz_num]
+  miss <- as.data.frame(lapply(nums, function(x) as.numeric(is.na(x))))
+  names(miss) <- paste0(amz_num,"_Missing")
+  for(v in amz_num) nums[[v]][is.na(nums[[v]])] <- prep$medians[v]
+  if(style=="pieces") { vars <- "Pieces"; cats <- character() }
+  else if(style %in% c("eda","eda_age_year")) {
+    vars <- c("Pieces","Unique_Pieces","Minifigures"); cats <- "Theme"
+    if(style=="eda_age_year") {vars <- c(vars,"Age_Min"); cats <- c(cats,"Year")}
+  } else if(style=="spline") {
+    vars <- c("Pieces","Minifigures","Age_Min"); cats <- c("Theme","Year","Size")
+  } else { vars <- amz_num; cats <- amz_cat }
+  x <- nums[vars]
+  if(style %in% c("spline","transformed")) {
+    for(v in setdiff(vars,"Age_Min")) x[[v]] <- log1p(x[[v]])
+  }
+  if(style=="spline") {
+    x$Pieces <- NULL
+    basis <- predict(prep$piece_spline, log1p(nums$Pieces))
+    for(j in seq_len(ncol(basis))) x[[paste0("Pieces_Spline",j)]] <- basis[,j]
+  }
+  x <- cbind(x, miss[paste0(vars,"_Missing")])
+  for(v in cats) {
+    mp <- prep$categories[[v]]
+    values <- dat[[v]]; values[is.na(values)] <- "Missing"
+    values[!values %in% mp$keep] <- "Other"
+    # Drop the reference dummy. Unused columns are handled at fit time.
+    for(lev in mp$levels[-1]) x[[paste(v,lev,sep="__")]] <- as.numeric(values==lev)
+  }
+  names(x) <- make.names(names(x), unique=TRUE)
+  stopifnot(!anyNA(x), !any(grepl("Amazon|Price|Set_Name|Item_Number",names(x))))
+  x
+}
+```
+
+## 4. Candidate models and prediction functions
+
+The candidates include a mean-price benchmark, a piece-count regression, an
+EDA-variable regression, an expanded regression, and an EDA model adding year and
+age. Log-price regression uses a natural spline for log piece count and a smearing
+correction when returning to dollars. A Gamma model uses a log link to model a
+positive conditional mean directly. Ridge penalties address overlapping predictors.
+Random forests provide a comparison allowing nonlinear relationships and interactions.
+The log forest uses out-of-bag residuals for its smearing correction. All models
+receive the same nonnegative prediction constraint before scoring.
+
+```{r amz-model-4}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Different lambda/mtry values are candidates selected by development CV.
+# Ridge uses standardized predictors and the objective MSE + lambda*sum(beta^2).
+amz_specs <- data.frame(
+  Model=c("Training mean", "Pieces linear", "EDA linear", "Expanded linear",
+          "Log price spline", "Gamma log spline", "Ridge 0.01", "Ridge 0.1",
+          "Ridge 1", "Forest dollars mtry 4", "Forest dollars mtry 8", "Forest log price"),
+  Engine=c("mean",rep("lm",4),"gamma",rep("ridge",3),rep("forest",3)),
+  Style=c("pieces","pieces","eda","expanded","spline","spline",
+          rep("transformed",6)),
+  Log_Response=c(FALSE,FALSE,FALSE,FALSE,TRUE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,TRUE),
+  Lambda=c(rep(NA_real_,6),0.01,0.1,1,rep(NA_real_,3)),
+  Mtry=c(rep(NA_integer_,9),4L,8L,4L), stringsAsFactors=FALSE)
+amz_specs <- rbind(amz_specs,data.frame(Model="EDA plus year and age",Engine="lm",
+  Style="eda_age_year",Log_Response=FALSE,Lambda=NA_real_,Mtry=NA_integer_))
+amz_fit <- function(train, spec, seed) {
+  set.seed(seed)
+  prep <- amz_learn_prep(train)
+  xx <- amz_design(train, prep, spec$Style)
+  y <- train$Amazon_Price
+  yy <- if(spec$Log_Response) log(y) else y
+  nonconstant <- vapply(xx,function(x) length(unique(x))>1L,logical(1))
+  x <- xx[,nonconstant,drop=FALSE]
+  result <- list(spec=spec, prep=prep, columns=names(x), smear=1)
+  if(spec$Engine=="mean") {
+    result$fit <- mean(y)
+  } else if(spec$Engine %in% c("lm","gamma")) {
+    # Keep a full-rank training design, with exactly the same columns at predict time.
+    qr_x <- qr(cbind(Intercept=1,as.matrix(x)))
+    kept <- sort(qr_x$pivot[seq_len(qr_x$rank)])
+    cols <- setdiff(colnames(qr_x$qr)[kept],"Intercept")
+    result$columns <- cols
+    frame <- data.frame(response=yy,x[,cols,drop=FALSE],check.names=FALSE)
+    result$fit <- if(spec$Engine=="lm") {
+      lm(response ~ ., data=frame, x=TRUE,y=TRUE)
+    } else {
+      glm(response ~ ., data=frame, family=Gamma(link="log"),
+          control=glm.control(maxit=100),x=TRUE,y=TRUE)
+    }
+    if(spec$Engine=="gamma" && !result$fit$converged) stop("Gamma model did not converge")
+    if(spec$Log_Response) result$smear <- mean(exp(residuals(result$fit)))
+  } else if(spec$Engine=="ridge") {
+    mat <- as.matrix(x)
+    result$center <- colMeans(mat); result$scale <- apply(mat,2,sd)
+    zz <- scale(mat,center=result$center,scale=result$scale)
+    result$intercept <- mean(yy)
+    result$fit <- solve(crossprod(zz)+nrow(zz)*spec$Lambda*diag(ncol(zz)),
+                        crossprod(zz,yy-result$intercept))
+  } else if(spec$Engine=="forest") {
+    result$fit <- randomForest::randomForest(x=x,y=yy,ntree=400,
+      mtry=min(spec$Mtry,ncol(x)),nodesize=5,importance=TRUE)
+    # OOB residuals avoid using optimistic in-sample forest residuals to estimate smearing.
+    if(spec$Log_Response) result$smear <- mean(exp(yy-result$fit$predicted),na.rm=TRUE)
+  }
+  result
+}
+amz_predict <- function(object, newdata) {
+  x <- amz_design(newdata,object$prep,object$spec$Style)[,object$columns,drop=FALSE]
+  engine <- object$spec$Engine
+  pred <- if(engine=="mean") rep(object$fit,nrow(newdata)) else if(engine=="ridge") {
+    zz <- scale(as.matrix(x),center=object$center,scale=object$scale)
+    as.numeric(object$intercept+zz%*%object$fit)
+  } else if(engine=="gamma") as.numeric(predict(object$fit,newdata=x,type="response"))
+  else as.numeric(predict(object$fit,newdata=x))
+  if(object$spec$Log_Response) pred <- exp(pred)*object$smear
+  if(any(!is.finite(pred))) stop("Nonfinite predictions: inspect model extrapolation.")
+  pmax(0,pred) # Prices cannot be negative; apply the same constraint before scoring.
+}
+amz_metrics <- function(actual,predicted) {
+  stopifnot(length(actual)==length(predicted),all(is.finite(actual)),all(is.finite(predicted)))
+  data.frame(N=length(actual),RMSE=sqrt(mean((predicted-actual)^2)),
+    MAE=mean(abs(predicted-actual)),Bias=mean(predicted-actual),
+    R2=if(sum((actual-mean(actual))^2)>0) 1-sum((predicted-actual)^2)/sum((actual-mean(actual))^2) else NA_real_)
+}
+```
+
+## 5. Repeated cross-validation and model selection
+
+We use the same assessment folds for all candidates, including the ridge and
+forest tuning settings. All medians and category decisions are refitted within
+each fold. A model must finish every assessment fold to be eligible. The model
+with the lowest pooled CV RMSE is selected before any calibration or test errors
+are examined. CV estimates used for choosing among candidates can be optimistic;
+the reserved test sample assesses the selected procedure. Small differences in
+CV error should not be treated as proof of a meaningful advantage.
+
+```{r amz-model-5}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+amz_cv_predictions <- list(); amz_cv_failures <- list(); amz_counter <- 0L
+for(rep_i in seq_len(amz_repeats)) {
+  set.seed(amz_seed+100L+rep_i)
+  fold_id <- integer(nrow(amz_development))
+  for(i in split(seq_len(nrow(amz_development)),amz_strata(amz_development))) {
+    fold_id[i] <- sample(rep(seq_len(amz_folds),length.out=length(i)))
+  }
+  for(fold_i in seq_len(amz_folds)) {
+    assessment <- which(fold_id==fold_i)
+    fold_train <- amz_development[-assessment,]
+    fold_assess <- amz_development[assessment,]
+    for(j in seq_len(nrow(amz_specs))) {
+      spec <- amz_specs[j,,drop=FALSE]
+      value <- tryCatch({
+        fit <- amz_fit(fold_train,spec,amz_seed+1000L*rep_i+100L*fold_i+j)
+        data.frame(Model=spec$Model,Repeat=rep_i,Fold=fold_i,
+          Item_Number=fold_assess$Item_Number,Actual=fold_assess$Amazon_Price,
+          Predicted=amz_predict(fit,fold_assess))
+      },error=function(e) e)
+      amz_counter <- amz_counter+1L
+      if(inherits(value,"error")) {
+        amz_cv_failures[[length(amz_cv_failures)+1L]] <- data.frame(
+          Model=spec$Model,Repeat=rep_i,Fold=fold_i,Reason=conditionMessage(value))
+      } else amz_cv_predictions[[length(amz_cv_predictions)+1L]] <- value
+    }
+  }
+  message("Completed cross-validation repeat ",rep_i," of ",amz_repeats)
+}
+amz_cv_predictions <- bind_rows(amz_cv_predictions)
+amz_cv_failures <- bind_rows(amz_cv_failures)
+amz_cv_summary <- amz_cv_predictions |>
+  group_by(Model) |>
+  summarise(Predictions=n(),CV_RMSE=sqrt(mean((Predicted-Actual)^2)),
+    CV_MAE=mean(abs(Predicted-Actual)),
+    CV_R2=1-sum((Predicted-Actual)^2)/sum((Actual-mean(Actual))^2),.groups="drop") |>
+  mutate(Complete=Predictions==nrow(amz_development)*amz_repeats) |>
+  arrange(desc(Complete),CV_RMSE)
+print(amz_cv_summary,n=Inf)
+if(nrow(amz_cv_failures)) print(amz_cv_failures)
+amz_eligible <- filter(amz_cv_summary,Complete)
+if(!nrow(amz_eligible)) stop("No model completed every fold; inspect cv-failures.csv.")
+amz_best_name <- amz_eligible$Model[1]
+amz_best_spec <- amz_specs[match(amz_best_name,amz_specs$Model),,drop=FALSE]
+cat("\nSelected by development CV RMSE:",amz_best_name,"\n")
+write.csv(amz_cv_summary,file.path(amz_output_dir,"cv-model-comparison.csv"),row.names=FALSE)
+write.csv(amz_cv_predictions,file.path(amz_output_dir,"cv-predictions.csv"),row.names=FALSE)
+if(nrow(amz_cv_failures)) write.csv(amz_cv_failures,file.path(amz_output_dir,"cv-failures.csv"),row.names=FALSE)
+amz_cv_plot <- ggplot(amz_cv_summary,aes(x=reorder(Model,CV_RMSE),y=CV_RMSE,fill=Complete))+
+  geom_col()+coord_flip()+labs(title="Development cross-validation error",x=NULL,y="RMSE in dollars")+
+  scale_fill_manual(values=c("TRUE"="#2878B5","FALSE"="#E76F51"))+theme_minimal(base_size=12)
+amz_show_plot(amz_cv_plot)
+ggsave(file.path(amz_output_dir,"cv-model-comparison.png"),amz_cv_plot,width=9,height=6,dpi=160)
+```
+
+## 6. Final fit and calibrated prediction intervals
+
+The chosen model fits the development sample. Absolute errors on the separate
+calibration sample determine a 90% split-conformal prediction interval for an
+individual set's Amazon price. These intervals target marginal coverage for data
+exchangeable with the observed-price sample. They do not promise 90% coverage in
+every subgroup, for future release years, or for sets whose missing prices arise
+from a different process. Keep this development fit for the calibrated intervals.
+Refitting on calibration or test observations requires a new evaluation.
+
+```{r amz-model-6}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Freeze the model choice before looking at calibration or test errors.
+amz_final_model <- amz_fit(amz_development,amz_best_spec,amz_seed+9000L)
+amz_calibration_pred <- amz_predict(amz_final_model,amz_calibration)
+amz_calibration_scores <- abs(amz_calibration$Amazon_Price-amz_calibration_pred)
+amz_q_index <- min(length(amz_calibration_scores),
+  ceiling((length(amz_calibration_scores)+1)*amz_interval_level))
+amz_interval_radius <- sort(amz_calibration_scores)[amz_q_index]
+amz_predict_interval <- function(model,newdata,radius=amz_interval_radius) {
+  pred <- amz_predict(model,newdata)
+  data.frame(Predicted=pred,Lower=pmax(0,pred-radius),Upper=pred+radius)
+}
+# This is a split-conformal interval for an individual Amazon price. It targets
+# marginal coverage under exchangeability with the priced population, not
+# coverage within every age/year/price subgroup. Shifted or unpriced sets may differ.
+amz_test_pred <- amz_predict_interval(amz_final_model,amz_test)
+amz_test_results <- cbind(amz_test[c("Item_Number","Set_Name","Year","Amazon_Price")],amz_test_pred)
+amz_test_results$Error <- amz_test_results$Predicted-amz_test_results$Amazon_Price
+amz_test_results$Covered <- with(amz_test_results,Amazon_Price>=Lower & Amazon_Price<=Upper)
+amz_test_score <- amz_metrics(amz_test$Amazon_Price,amz_test_pred$Predicted)
+amz_test_score$Model <- amz_best_name
+amz_test_score$Interval_Level <- amz_interval_level
+amz_test_score$Observed_Coverage <- mean(amz_test_results$Covered)
+amz_test_score$Mean_Interval_Width <- mean(amz_test_pred$Upper-amz_test_pred$Lower)
+print(amz_test_score)
+
+# Predetermined reference models on the SAME final test sets. Do not use this
+# comparison to change the selected model or tune another round of candidates.
+amz_reference_scores <- bind_rows(lapply(c("Training mean","EDA linear"),function(name) {
+  sp <- amz_specs[match(name,amz_specs$Model),,drop=FALSE]
+  fit <- amz_fit(amz_development,sp,amz_seed+9001L)
+  cbind(Model=name,amz_metrics(amz_test$Amazon_Price,amz_predict(fit,amz_test)))
+}),cbind(Model=amz_best_name,amz_metrics(amz_test$Amazon_Price,amz_test_pred$Predicted))) |>
+  distinct(Model,.keep_all=TRUE)
+print(amz_reference_scores)
+write.csv(amz_test_score,file.path(amz_output_dir,"selected-model-test-metrics.csv"),row.names=FALSE)
+write.csv(amz_reference_scores,file.path(amz_output_dir,"test-reference-comparison.csv"),row.names=FALSE)
+write.csv(amz_test_results,file.path(amz_output_dir,"test-predictions-and-intervals.csv"),row.names=FALSE)
+```
+
+## 7. Error patterns and model diagnostics
+
+Positive Bias means overprediction, while negative Bias means underprediction.
+The price-band table checks the presentation's concern about expensive sets, with
+sample sizes shown for each band. The residual graph uses development predictions
+from held-out CV folds instead of fitted training values. Large Cook's distances
+flag observations for review in the EDA linear reference; they are not automatic
+deletion rules. Forest importance ranks predictive contributions in this fit and
+does not establish causation. Correlated features can share importance.
+
+```{r amz-model-7}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+amz_test_results$Price_Band <- factor(ifelse(amz_test_results$Amazon_Price<30,"Under $30",
+  ifelse(amz_test_results$Amazon_Price<=100,"$30 to $100","Over $100")),
+  levels=c("Under $30","$30 to $100","Over $100"))
+amz_group_metrics <- function(dat,group) {
+  bind_rows(lapply(split(dat,dat[[group]],drop=TRUE),function(x) {
+    cbind(Group=as.character(x[[group]][1]),amz_metrics(x$Amazon_Price,x$Predicted),
+      Coverage=mean(x$Covered),Mean_Actual=mean(x$Amazon_Price),Mean_Predicted=mean(x$Predicted))
+  }))
+}
+amz_band_results <- amz_group_metrics(amz_test_results,"Price_Band")
+amz_year_results <- amz_group_metrics(amz_test_results,"Year")
+print(amz_band_results); print(amz_year_results)
+write.csv(amz_band_results,file.path(amz_output_dir,"test-error-by-price-band.csv"),row.names=FALSE)
+write.csv(amz_year_results,file.path(amz_output_dir,"test-error-by-release-year.csv"),row.names=FALSE)
+amz_actual_plot <- ggplot(amz_test_results,aes(x=Amazon_Price,y=Predicted,color=Year))+
+  geom_abline(slope=1,intercept=0,linetype="dashed",color="grey40")+
+  geom_point(alpha=0.7)+coord_equal()+
+  labs(title=paste("Final test predictions:",amz_best_name),x="Actual Amazon price ($)",y="Predicted price ($)")+
+  theme_minimal(base_size=12)
+amz_show_plot(amz_actual_plot)
+ggsave(file.path(amz_output_dir,"test-actual-versus-predicted.png"),amz_actual_plot,width=8,height=6,dpi=160)
+amz_oof <- amz_cv_predictions |> filter(Model==amz_best_name) |>
+  group_by(Item_Number) |> summarise(Actual=first(Actual),Predicted=mean(Predicted),.groups="drop") |>
+  mutate(Residual=Actual-Predicted)
+amz_residual_plot <- ggplot(amz_oof,aes(x=Predicted,y=Residual))+
+  geom_hline(yintercept=0,linetype="dashed")+geom_point(alpha=0.5,color="#2878B5")+
+  geom_smooth(method="loess",formula=y~x,se=FALSE,color="#E76F51")+
+  labs(title="Development errors from held-out folds",subtitle="Predictions averaged across CV repeats",
+       x="Predicted Amazon price ($)",y="Actual minus predicted ($)")+theme_minimal(base_size=12)
+amz_show_plot(amz_residual_plot)
+ggsave(file.path(amz_output_dir,"development-residuals.png"),amz_residual_plot,width=8,height=6,dpi=160)
+amz_largest_errors <- amz_test_results |> arrange(desc(abs(Error))) |> head(10)
+print(amz_largest_errors)
+# Influence diagnostics apply to the EDA linear reference. A large Cook's
+# distance flags a set for review; it is not a rule for deleting expensive sets.
+amz_eda_diagnostic_model <- amz_fit(amz_development,
+  amz_specs[match("EDA linear",amz_specs$Model),,drop=FALSE],amz_seed+9100L)
+amz_influence <- data.frame(amz_development[c("Item_Number","Set_Name","Amazon_Price")],
+  Cooks_Distance=cooks.distance(amz_eda_diagnostic_model$fit),
+  Leverage=hatvalues(amz_eda_diagnostic_model$fit),
+  Studentized_Residual=rstudent(amz_eda_diagnostic_model$fit)) |>
+  arrange(desc(Cooks_Distance))
+print(head(amz_influence,10))
+write.csv(amz_influence,file.path(amz_output_dir,"eda-linear-influence.csv"),row.names=FALSE)
+if(amz_best_spec$Engine=="forest") {
+  imp <- randomForest::importance(amz_final_model$fit,type=1)
+  amz_importance <- data.frame(Feature=rownames(imp),Permutation_Importance=as.numeric(imp[,1])) |>
+    arrange(desc(Permutation_Importance))
+  print(head(amz_importance,15))
+  write.csv(amz_importance,file.path(amz_output_dir,"selected-model-variable-importance.csv"),row.names=FALSE)
+} else if(amz_best_spec$Engine %in% c("lm","gamma")) {
+  print(summary(amz_final_model$fit))
+  # Coefficients/p-values after CV selection are descriptive, not confirmatory.
+}
+```
+
+## 8. LEGO recommended price as a generalizability check
+
+The assignment's generalizability question is whether a model trained on
+Amazon price also predicts LEGO recommended price. We answer that by comparing
+the frozen Amazon-model predictions with both targets on the same paired test
+sets. The additional listed-price benchmark instead asks how well LEGO's price
+alone approximates Amazon's price. That benchmark never enters model fitting or
+selection. Different target variances affect R-squared, and differences in dollar
+error or bias should also guide the interpretation. Amazon-calibrated intervals
+have no coverage guarantee for LEGO prices.
+
+```{r amz-model-8}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# The selected AMAZON model and its predictions are now frozen. Evaluate its
+# point predictions against LEGO prices for held-out sets with both targets.
+# This is response transfer, distinct from using LEGO Price to predict Amazon.
+amz_lego_price <- amz_number(amz_raw$Price)
+amz_lego_lookup <- setNames(amz_lego_price,as.character(amz_raw$Item_Number))
+amz_transfer <- amz_test_results
+amz_transfer$LEGO_Price <- unname(amz_lego_lookup[amz_transfer$Item_Number])
+amz_transfer <- amz_transfer[is.finite(amz_transfer$LEGO_Price) & amz_transfer$LEGO_Price>0,]
+amz_transfer_scores <- bind_rows(
+  cbind(Target="Amazon price on paired test sets",amz_metrics(amz_transfer$Amazon_Price,amz_transfer$Predicted)),
+  cbind(Target="LEGO price on paired test sets",amz_metrics(amz_transfer$LEGO_Price,amz_transfer$Predicted)))
+print(amz_transfer_scores)
+# An additional descriptive purchasing benchmark on exactly those same sets.
+amz_lego_benchmark <- amz_metrics(amz_transfer$Amazon_Price,amz_transfer$LEGO_Price)
+print(cbind(Benchmark="Use LEGO listed price as Amazon estimate",amz_lego_benchmark))
+write.csv(amz_transfer_scores,file.path(amz_output_dir,"lego-price-generalizability.csv"),row.names=FALSE)
+write.csv(amz_transfer,file.path(amz_output_dir,"paired-test-price-check.csv"),row.names=FALSE)
+```
+
+## 9. Predictions for unpriced sets and a reusable saved model
+
+The final export estimates Amazon prices for the 478 unpriced sets. Their true
+Amazon prices remain unknown, so these rows cannot measure accuracy. Review the
+missing-value, unseen-category, and extrapolation flags before using an estimate
+for a purchasing decision. A prediction truncated to zero is a model boundary
+failure that needs manual review, rather than evidence that a set is free. The
+saved model stores preprocessing, calibration, split membership, and package
+versions. The example at the end shows how to apply it to another raw-data file.
+
+```{r amz-model-9}
+if (!exists("amz_output_dir")) amz_output_dir <- "modeling-results"
+dir.create(amz_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+amz_support_flags <- function(dat,prep) {
+  vapply(seq_len(nrow(dat)),function(i) {
+    reasons <- character()
+    for(v in amz_num) {
+      if(is.na(dat[[v]][i])) reasons <- c(reasons,paste("Missing",v))
+      else if(dat[[v]][i]<prep$ranges[[v]][1] || dat[[v]][i]>prep$ranges[[v]][2]) {
+        reasons <- c(reasons,paste(v,"outside development range"))
+      }
+    }
+    for(v in amz_cat) {
+      val <- dat[[v]][i]; if(is.na(val)) val <- "Missing"
+      if(!val %in% prep$categories[[v]]$seen) reasons <- c(reasons,paste("Unseen",v))
+    }
+    if(length(reasons)) paste(reasons,collapse="; ") else "Within observed predictor support"
+  },character(1))
+}
+amz_missing_predictions <- cbind(amz_unpriced[c("Item_Number","Set_Name","Year")],
+  amz_predict_interval(amz_final_model,amz_unpriced))
+amz_missing_predictions$Review_Flags <- amz_support_flags(amz_unpriced,amz_final_model$prep)
+amz_zero_predictions <- amz_missing_predictions$Predicted<=0
+amz_missing_predictions$Review_Flags[amz_zero_predictions] <- paste(
+  amz_missing_predictions$Review_Flags[amz_zero_predictions],
+  "Nonpositive model estimate truncated to $0; manual review",sep="; ")
+amz_missing_predictions$Status <- "Estimated Amazon price; actual Amazon price unavailable"
+print(head(amz_missing_predictions,10))
+write.csv(amz_missing_predictions,file.path(amz_output_dir,"unpriced-set-predictions.csv"),row.names=FALSE)
+amz_model_bundle <- list(model=amz_final_model,interval_radius=amz_interval_radius,
+  interval_level=amz_interval_level,split=amz_membership,seed=amz_seed,
+  cv_results=amz_cv_summary,test_metrics=amz_test_score,
+  package_versions=vapply(amz_packages,function(p) as.character(packageVersion(p)),character(1)))
+saveRDS(amz_model_bundle,file.path(amz_output_dir,"amazon-price-model.rds"))
+writeLines(capture.output(sessionInfo()),file.path(amz_output_dir,"session-info.txt"))
+# Example for a FUTURE raw-data file with the same predictor columns:
+# bundle <- readRDS("modeling-results/amazon-price-model.rds")
+# new_raw <- readr::read_csv("new-lego-sets.csv",locale=readr::locale(encoding="Latin1"))
+# new_raw$Amazon_Price <- NA_character_ # no response needed at prediction time
+# new_sets <- amz_clean(new_raw)
+# amz_predict_interval(bundle$model,new_sets,bundle$interval_radius)
+# amz_support_flags(new_sets,bundle$model$prep)
+# Keep the development fit for these calibrated intervals. Refitting on the
+# calibration/test rows invalidates both the reported test evaluation and this
+# calibration radius. A later refit needs new calibration and validation data.
+```
+
+## Interpretation and reporting
+
+- Report the selected model, the CV selection rule, the split sizes, test RMSE,
+  MAE, R-squared, bias, and observed prediction interval coverage.
+- Compare all candidate models using CV, rather than repeatedly choosing based
+  on the final test set. The presentation and this analysis use different splits
+  and training procedures, so their test RMSE values are not directly comparable.
+- Check whether year and age add information beyond the original EDA predictors.
+  The dedicated comparison and the expanded regression help assess that question.
+- Discuss missingness and the fact that validation describes sets with observed
+  Amazon prices. Performance for unpriced sets or future releases remains uncertain.
+- Coefficient tests after model selection are exploratory. The goal here is
+  prediction, with all substantive effects interpreted conditionally and cautiously.
 
